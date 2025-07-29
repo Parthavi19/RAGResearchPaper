@@ -1,19 +1,33 @@
 import os
+import sys
 import time
 import logging
 import threading
+import traceback
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
 from concurrent.futures import ThreadPoolExecutor
-from pipelined_research_rag import PipelinedResearchPaperRAG
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables first
 load_dotenv()
 
-# Set logging level to INFO (DEBUG can be too verbose for production)
-logging.basicConfig(level=logging.INFO)
+# Enhanced logging setup for Cloud Run
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
+
+# Import RAG after logging setup
+try:
+    from pipelined_research_rag import PipelinedResearchPaperRAG
+    logger.info("Successfully imported PipelinedResearchPaperRAG")
+except Exception as e:
+    logger.error(f"Failed to import PipelinedResearchPaperRAG: {e}")
+    logger.error(traceback.format_exc())
+    sys.exit(1)
 
 # Create Flask app
 app = Flask(__name__)
@@ -26,6 +40,38 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
 # Environment variables
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+logger.info(f"Environment check - GOOGLE_API_KEY present: {bool(GOOGLE_API_KEY)}")
+
+# Test imports and dependencies
+try:
+    import google.generativeai as genai
+    logger.info("Successfully imported google.generativeai")
+except Exception as e:
+    logger.error(f"Failed to import google.generativeai: {e}")
+
+try:
+    import torch
+    logger.info(f"PyTorch version: {torch.__version__}")
+except Exception as e:
+    logger.error(f"Failed to import torch: {e}")
+
+try:
+    from transformers import AutoTokenizer, AutoModel
+    logger.info("Successfully imported transformers")
+except Exception as e:
+    logger.error(f"Failed to import transformers: {e}")
+
+try:
+    from qdrant_client import QdrantClient
+    logger.info("Successfully imported qdrant_client")
+except Exception as e:
+    logger.error(f"Failed to import qdrant_client: {e}")
+
+try:
+    import PyPDF2
+    logger.info("Successfully imported PyPDF2")
+except Exception as e:
+    logger.error(f"Failed to import PyPDF2: {e}")
 
 # Session state
 rag_instances = {}
@@ -165,48 +211,89 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
     try:
-        file = request.files.get('file')
-        session_id = request.form.get('session_id')
+        logger.info("Upload endpoint called")
+        
+        # Validate request
+        if 'file' not in request.files:
+            logger.error("No file in request")
+            return jsonify({'error': 'No file provided'}), 400
+            
+        if 'session_id' not in request.form:
+            logger.error("No session_id in request")
+            return jsonify({'error': 'No session_id provided'}), 400
+        
+        file = request.files['file']
+        session_id = request.form['session_id']
+        
+        logger.info(f"Processing file: {file.filename} for session: {session_id}")
 
-        if not file or not session_id:
-            logger.error("Missing file or session_id")
-            return jsonify({'error': 'Missing file or session_id'}), 400
+        if not file or file.filename == '':
+            logger.error("Empty file provided")
+            return jsonify({'error': 'No file selected'}), 400
 
         if not file.filename.lower().endswith('.pdf'):
+            logger.error(f"Invalid file type: {file.filename}")
             return jsonify({'error': 'Only PDF files are supported'}), 400
 
         # Check if Google API key is available
-        if not GOOGLE_API_KEY:
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        if not google_api_key:
             logger.error("GOOGLE_API_KEY not found in environment variables")
-            return jsonify({'error': 'Server configuration error: Missing API key'}), 500
+            return jsonify({'error': 'Server configuration error: Missing Google API key'}), 500
 
+        logger.info(f"Google API key found: {google_api_key[:10]}...")
+
+        # Create RAG instance
         with processing_lock:
             if session_id not in rag_instances:
                 logger.info(f"Creating new RAG instance for session {session_id}")
                 try:
-                    rag = PipelinedResearchPaperRAG(collection_name=f"collection_{session_id}")
+                    collection_name = f"collection_{session_id}"
+                    logger.info(f"Initializing RAG with collection: {collection_name}")
+                    
+                    rag = PipelinedResearchPaperRAG(collection_name=collection_name)
                     rag_instances[session_id] = rag
+                    logger.info(f"RAG instance created successfully for session {session_id}")
+                    
                 except Exception as e:
                     logger.error(f"Failed to create RAG instance: {e}")
+                    logger.error(traceback.format_exc())
                     return jsonify({'error': f'Failed to initialize RAG system: {str(e)}'}), 500
             else:
+                logger.info(f"Using existing RAG instance for session {session_id}")
                 rag = rag_instances[session_id]
 
         # Save file
-        filename = secure_filename(f"{session_id}_{file.filename}")
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(file_path)
-        logger.info(f"Saved file to {file_path}")
+        try:
+            filename = secure_filename(f"{session_id}_{file.filename}")
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(file_path)
+            logger.info(f"File saved to: {file_path}")
+            
+            # Verify file was saved
+            if not os.path.exists(file_path):
+                raise Exception(f"File was not saved properly: {file_path}")
+                
+            file_size = os.path.getsize(file_path)
+            logger.info(f"Saved file size: {file_size} bytes")
+            
+        except Exception as e:
+            logger.error(f"Failed to save file: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': f'Failed to save file: {str(e)}'}), 500
 
         # Process paper
         try:
+            logger.info("Starting paper processing...")
             metadata = rag.load_research_paper(file_path)
+            logger.info("Paper processing completed successfully")
             
             # Clean up the uploaded file
             try:
                 os.remove(file_path)
-            except:
-                pass
+                logger.info("Temporary file cleaned up")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup file: {cleanup_error}")
             
             return jsonify({
                 'message': 'Paper uploaded and indexed successfully.',
@@ -214,18 +301,23 @@ def upload_pdf():
                 'collection_name': rag.collection_name,
                 'paper_metadata': metadata
             }), 200
+            
         except Exception as e:
-            logger.exception("Failed to process paper")
+            logger.error(f"Failed to process paper: {e}")
+            logger.error(traceback.format_exc())
+            
             # Clean up on failure
             try:
                 os.remove(file_path)
             except:
                 pass
+                
             return jsonify({'error': f'Failed to process paper: {str(e)}'}), 500
 
     except Exception as e:
-        logger.exception("Unexpected error in upload_pdf")
-        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+        logger.error(f"Unexpected error in upload_pdf: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Unexpected server error: {str(e)}'}), 500
 
 # Query route
 @app.route('/query', methods=['POST'])
@@ -323,4 +415,3 @@ def internal_error(error):
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
-
