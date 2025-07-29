@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import threading
-import uuid
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from concurrent.futures import ThreadPoolExecutor
@@ -11,42 +10,47 @@ from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-# Enable debug logging
-logging.basicConfig(level=logging.DEBUG)
-
 # Load environment variables
 load_dotenv()
 
+# Set logging level to DEBUG
+logging.basicConfig(level=logging.DEBUG)
+
+# Create Flask app
 app = Flask(__name__)
+
+# Upload folder
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# Environment config
+# Environment variables
 API_KEY = os.getenv("API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# Session storage
+# Session state
 rag_instances = {}
 processing_lock = threading.Lock()
 
+# Home route
 @app.route('/')
 def index():
     return render_template('index.html', sessions=list(rag_instances.keys()))
 
+# Upload PDF route
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
     file = request.files.get('file')
     session_id = request.form.get('session_id')
 
-    logging.debug(f"Received upload - session_id: {session_id}, file: {file.filename if file else 'None'}")
-
     if not file or not session_id:
+        logging.error("Missing file or session_id")
         return jsonify({'error': 'Missing file or session_id'}), 400
 
     with processing_lock:
         if session_id not in rag_instances:
+            logging.info(f"Creating new RAG instance for session {session_id}")
             rag = PipelinedResearchPaperRAG(
                 api_key=API_KEY,
                 qdrant_url=QDRANT_URL,
@@ -60,14 +64,12 @@ def upload_pdf():
             rag = rag_instances[session_id]
 
     filename = secure_filename(f"{session_id}_{file.filename}")
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
-
-    logging.debug(f"File saved to: {file_path}")
+    logging.debug(f"Saved file to {file_path}")
 
     try:
         metadata = rag.load_research_paper(file_path)
-        logging.debug(f"Metadata loaded: {metadata}")
         return jsonify({
             'message': 'Paper uploaded and indexed successfully.',
             'session_id': session_id,
@@ -78,19 +80,20 @@ def upload_pdf():
         logging.exception("Failed to process paper.")
         return jsonify({'error': str(e)}), 500
 
+# Query route
 @app.route('/query', methods=['POST'])
 def query():
     data = request.json
     question = data.get('question')
     session_id = data.get('session_id')
 
-    logging.debug(f"Query received - session_id: {session_id}, question: {question}")
-
     if not question or not session_id:
+        logging.error("Missing question or session_id in request")
         return jsonify({'error': 'Missing question or session_id'}), 400
 
     rag = rag_instances.get(session_id)
     if not rag:
+        logging.warning(f"Session ID {session_id} not found")
         return jsonify({'error': 'Invalid session_id'}), 404
 
     try:
@@ -108,15 +111,17 @@ def query():
             }
         }), 200
     except Exception as e:
-        logging.exception("Error during query.")
+        logging.exception("Error during query processing.")
         return jsonify({'error': str(e)}), 500
 
+# Clear session route
 @app.route('/clear/<session_id>', methods=['DELETE'])
 def clear_session(session_id):
     with processing_lock:
         rag = rag_instances.pop(session_id, None)
 
     if not rag:
+        logging.warning(f"Tried to clear non-existent session {session_id}")
         return jsonify({'error': 'Session not found'}), 404
 
     try:
@@ -126,6 +131,7 @@ def clear_session(session_id):
         logging.exception("Cleanup failed.")
         return jsonify({'error': str(e)}), 500
 
+# Health check
 @app.route('/health', methods=['GET'])
 def health():
     try:
@@ -136,5 +142,7 @@ def health():
         logging.warning(f"Qdrant health check failed: {e}")
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
 
+# Main entry point
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
