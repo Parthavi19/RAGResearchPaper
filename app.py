@@ -30,7 +30,15 @@ def safe_import_rag():
     except Exception as e:
         logger.error(f"Failed to import PipelinedResearchPaperRAG: {e}")
         logger.error(traceback.format_exc())
-        raise
+        # Create a dummy class for testing
+        class DummyRAG:
+            def __init__(self, collection_name):
+                self.collection_name = collection_name
+            def load_research_paper(self, path):
+                return {"status": "dummy mode - RAG import failed"}
+            def query(self, question):
+                return "RAG system not available - check server logs"
+        return DummyRAG
 
 # Import with error handling
 PipelinedResearchPaperRAG = safe_import_rag()
@@ -52,42 +60,83 @@ logger.info(f"Environment check - GOOGLE_API_KEY present: {bool(GOOGLE_API_KEY)}
 rag_instances = {}
 processing_lock = threading.Lock()
 
-# HTML template as string (since templates folder might not exist)
+# HTML template as string
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>RAG Bot</title>
+  <title>RAG Research Paper Bot</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .loading { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+  </style>
 </head>
-<body class="bg-gray-100 min-h-screen flex flex-col items-center justify-start py-10 px-4">
-  <div class="bg-white shadow-lg rounded-lg p-6 max-w-xl w-full">
-    <h1 class="text-2xl font-bold mb-4 text-center">RAG Bot</h1>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+  <div class="container mx-auto px-4 py-8">
+    <div class="max-w-4xl mx-auto">
+      <!-- Header -->
+      <div class="text-center mb-8">
+        <h1 class="text-4xl font-bold text-gray-800 mb-2">RAG Research Paper Bot</h1>
+        <p class="text-gray-600">Upload a PDF research paper and ask questions about it</p>
+      </div>
 
-    <!-- Status indicator -->
-    <div id="status" class="mb-4 p-2 rounded text-center bg-blue-100 text-blue-800">
-      Ready to upload documents
+      <!-- Main Interface -->
+      <div class="bg-white rounded-lg shadow-lg p-6 mb-6">
+        <!-- Status -->
+        <div id="status" class="mb-6 p-4 rounded-lg text-center bg-blue-50 text-blue-800">
+          <span class="font-semibold">Ready</span> - Upload a PDF to get started
+        </div>
+
+        <!-- Session ID -->
+        <div class="mb-6">
+          <label class="block text-sm font-medium text-gray-700 mb-2">Session ID (optional)</label>
+          <input type="text" id="sessionId" placeholder="Auto-generated if empty" 
+                 class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+
+        <!-- Upload Section -->
+        <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 mb-6 hover:border-blue-400 transition-colors">
+          <form id="uploadForm" enctype="multipart/form-data">
+            <div class="text-center">
+              <svg class="mx-auto h-12 w-12 text-gray-400 mb-4" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <input type="file" id="fileInput" accept=".pdf" class="hidden" required />
+              <button type="button" onclick="document.getElementById('fileInput').click()" 
+                      class="mb-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-md border">
+                Choose PDF File
+              </button>
+              <p class="text-sm text-gray-500 mb-4">or drag and drop</p>
+              <div id="fileName" class="text-sm text-gray-700 mb-4 hidden"></div>
+              <button type="submit" id="uploadBtn" 
+                      class="w-full bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-md transition-colors">
+                Upload and Process
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <!-- Query Section -->
+        <div class="border border-gray-200 rounded-lg p-6">
+          <form id="queryForm">
+            <label class="block text-sm font-medium text-gray-700 mb-2">Ask a Question</label>
+            <div class="flex gap-2">
+              <input type="text" id="queryInput" placeholder="What is the main contribution of this paper?" 
+                     class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-green-500" required />
+              <button type="submit" id="queryBtn" 
+                      class="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-6 rounded-md transition-colors">
+                Ask
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Results -->
+      <div id="result" class="hidden"></div>
     </div>
-
-    <!-- Session ID Input -->
-    <input type="text" id="sessionId" placeholder="Session ID (auto-generated if empty)" class="border p-2 mb-4 w-full">
-
-    <!-- Upload Form -->
-    <form id="uploadForm" class="mb-4" enctype="multipart/form-data" method="POST">
-      <input type="file" id="fileInput" accept=".pdf" class="mb-2" required />
-      <button type="submit" id="uploadBtn" class="bg-blue-500 text-white px-4 py-2 rounded w-full">Upload Document</button>
-    </form>
-
-    <!-- Query Form -->
-    <form id="queryForm" class="mb-4">
-      <input type="text" id="queryInput" placeholder="Enter your question..." class="border p-2 w-full mb-2" required />
-      <button type="submit" id="queryBtn" class="bg-green-500 text-white px-4 py-2 rounded w-full">Ask Question</button>
-    </form>
-
-    <!-- Results -->
-    <div id="result" class="mt-6"></div>
   </div>
 
   <script>
@@ -95,41 +144,53 @@ INDEX_HTML = """
     const fileInput = document.getElementById('fileInput');
     const queryForm = document.getElementById('queryForm');
     const queryInput = document.getElementById('queryInput');
-    const resultContent = document.getElementById('result');
+    const resultDiv = document.getElementById('result');
     const sessionIdInput = document.getElementById('sessionId');
     const statusDiv = document.getElementById('status');
     const uploadBtn = document.getElementById('uploadBtn');
     const queryBtn = document.getElementById('queryBtn');
+    const fileNameDiv = document.getElementById('fileName');
 
     function setStatus(message, type = 'info') {
       const colors = {
-        info: 'bg-blue-100 text-blue-800',
-        success: 'bg-green-100 text-green-800',
-        error: 'bg-red-100 text-red-800',
-        warning: 'bg-yellow-100 text-yellow-800'
+        info: 'bg-blue-50 text-blue-800',
+        success: 'bg-green-50 text-green-800',
+        error: 'bg-red-50 text-red-800',
+        warning: 'bg-yellow-50 text-yellow-800'
       };
-      statusDiv.className = `mb-4 p-2 rounded text-center ${colors[type]}`;
-      statusDiv.textContent = message;
+      statusDiv.className = `mb-6 p-4 rounded-lg text-center ${colors[type]}`;
+      statusDiv.innerHTML = `<span class="font-semibold">${type.toUpperCase()}</span> - ${message}`;
     }
 
-    function setLoading(loading) {
-      uploadBtn.disabled = loading;
-      queryBtn.disabled = loading;
-      if (loading) {
-        uploadBtn.textContent = 'Processing...';
-        queryBtn.textContent = 'Processing...';
+    function setLoading(isLoading) {
+      uploadBtn.disabled = isLoading;
+      queryBtn.disabled = isLoading;
+      
+      if (isLoading) {
+        uploadBtn.innerHTML = '<span class="loading">Processing...</span>';
+        queryBtn.innerHTML = '<span class="loading">Processing...</span>';
       } else {
-        uploadBtn.textContent = 'Upload Document';
-        queryBtn.textContent = 'Ask Question';
+        uploadBtn.textContent = 'Upload and Process';
+        queryBtn.textContent = 'Ask';
       }
     }
 
-    // Upload document
+    // File input change handler
+    fileInput.addEventListener('change', function() {
+      if (this.files[0]) {
+        fileNameDiv.textContent = `Selected: ${this.files[0].name}`;
+        fileNameDiv.classList.remove('hidden');
+      } else {
+        fileNameDiv.classList.add('hidden');
+      }
+    });
+
+    // Upload form handler
     uploadForm.addEventListener('submit', async (e) => {
       e.preventDefault();
 
-      if (fileInput.files.length === 0) {
-        setStatus('Please select a PDF file to upload', 'error');
+      if (!fileInput.files[0]) {
+        setStatus('Please select a PDF file', 'error');
         return;
       }
 
@@ -155,29 +216,42 @@ INDEX_HTML = """
           throw new Error(result.error || 'Upload failed');
         }
 
-        setStatus('Document uploaded successfully! You can now ask questions.', 'success');
-        resultContent.innerHTML = `
-          <div class="bg-green-50 border border-green-200 rounded p-4">
-            <h3 class="font-semibold text-green-800">Upload Complete</h3>
-            <p class="text-sm text-green-600 mt-1">${result.message}</p>
-            <p class="text-xs text-gray-500 mt-2">Session: ${sessionId}</p>
+        setStatus('Document processed successfully! You can now ask questions.', 'success');
+        
+        resultDiv.innerHTML = `
+          <div class="bg-white rounded-lg shadow-lg p-6">
+            <h3 class="text-lg font-semibold text-green-800 mb-2">✅ Upload Complete</h3>
+            <div class="text-sm text-gray-600 space-y-1">
+              <p><strong>File:</strong> ${fileInput.files[0].name}</p>
+              <p><strong>Session:</strong> ${sessionId}</p>
+              <p><strong>Processing Time:</strong> ${result.processing_time || 'N/A'}s</p>
+            </div>
           </div>
         `;
+        resultDiv.classList.remove('hidden');
+
       } catch (err) {
         console.error('Upload error:', err);
-        setStatus('Upload failed. Please try again.', 'error');
-        resultContent.innerHTML = `<div class="bg-red-50 border border-red-200 rounded p-4 text-red-800">Error: ${err.message}</div>`;
+        setStatus(`Upload failed: ${err.message}`, 'error');
+        
+        resultDiv.innerHTML = `
+          <div class="bg-red-50 border border-red-200 rounded-lg p-4">
+            <h3 class="text-red-800 font-semibold">❌ Upload Failed</h3>
+            <p class="text-red-700 mt-1">${err.message}</p>
+          </div>
+        `;
+        resultDiv.classList.remove('hidden');
       } finally {
         setLoading(false);
       }
     });
 
-    // Query the uploaded document
+    // Query form handler
     queryForm.addEventListener('submit', async (e) => {
       e.preventDefault();
 
       const sessionId = sessionIdInput.value.trim();
-      const queryInputText = queryInput.value.trim();
+      const question = queryInput.value.trim();
 
       if (!sessionId) {
         setStatus('Please upload a document first', 'error');
@@ -191,7 +265,7 @@ INDEX_HTML = """
         const response = await fetch('/query', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question: queryInputText, session_id: sessionId })
+          body: JSON.stringify({ question, session_id: sessionId })
         });
 
         const result = await response.json();
@@ -201,78 +275,90 @@ INDEX_HTML = """
         }
 
         setStatus('Question answered successfully!', 'success');
-        resultContent.innerHTML = `
-          <div class="bg-gray-50 border rounded p-4">
-            <h3 class="font-semibold text-gray-800 mb-2">Question:</h3>
-            <p class="text-gray-700 mb-4">${queryInputText}</p>
-            <h3 class="font-semibold text-gray-800 mb-2">Answer:</h3>
-            <div class="text-gray-700 mb-4 whitespace-pre-wrap">${result.answer}</div>
+        
+        resultDiv.innerHTML = `
+          <div class="bg-white rounded-lg shadow-lg p-6">
+            <div class="border-l-4 border-blue-500 pl-4 mb-4">
+              <h3 class="font-semibold text-gray-800">Question:</h3>
+              <p class="text-gray-700">${question}</p>
+            </div>
+            <div class="border-l-4 border-green-500 pl-4 mb-4">
+              <h3 class="font-semibold text-gray-800">Answer:</h3>
+              <div class="text-gray-700 whitespace-pre-wrap">${result.answer}</div>
+            </div>
             <div class="text-xs text-gray-500 border-t pt-2">
-              Response time: ${result.performance?.query_time?.toFixed(2) || "?"} seconds
+              Response time: ${result.performance?.query_time || 'N/A'}s
             </div>
           </div>
         `;
+        resultDiv.classList.remove('hidden');
         
-        // Clear the query input
         queryInput.value = '';
-        
+
       } catch (err) {
         console.error('Query error:', err);
-        setStatus('Query failed. Please try again.', 'error');
-        resultContent.innerHTML = `<div class="bg-red-50 border border-red-200 rounded p-4 text-red-800">Error: ${err.message}</div>`;
+        setStatus(`Query failed: ${err.message}`, 'error');
+        
+        resultDiv.innerHTML = `
+          <div class="bg-red-50 border border-red-200 rounded-lg p-4">
+            <h3 class="text-red-800 font-semibold">❌ Query Failed</h3>
+            <p class="text-red-700 mt-1">${err.message}</p>
+          </div>
+        `;
+        resultDiv.classList.remove('hidden');
       } finally {
         setLoading(false);
       }
     });
+
+    // Test server connection on load
+    fetch('/health')
+      .then(response => response.json())
+      .then(data => {
+        if (data.status === 'healthy') {
+          setStatus('Server connected and ready', 'success');
+        } else {
+          setStatus('Server health check failed', 'warning');
+        }
+      })
+      .catch(err => {
+        setStatus('Unable to connect to server', 'error');
+        console.error('Health check failed:', err);
+      });
   </script>
 </body>
 </html>
 """
 
-# Home route
-@app.route('/')
+@app.route('/', methods=['GET'])
 def index():
+    """Home page"""
+    logger.info("Home page requested")
     return render_template_string(INDEX_HTML)
 
-# Health check route (simple and fast)
 @app.route('/health', methods=['GET'])
 def health():
+    """Health check endpoint"""
     try:
-        health_status = {
+        return jsonify({
             'status': 'healthy',
             'active_sessions': len(rag_instances),
             'google_api_configured': bool(GOOGLE_API_KEY),
-            'qdrant_configured': bool(os.getenv("QDRANT_URL") and os.getenv("QDRANT_API_KEY"))
-        }
-        
-        # Test Qdrant connection if configured
-        qdrant_url = os.getenv("QDRANT_URL")
-        qdrant_api_key = os.getenv("QDRANT_API_KEY")
-        
-        if qdrant_url and qdrant_api_key:
-            try:
-                from qdrant_client import QdrantClient
-                client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-                collections = client.get_collections()
-                health_status['qdrant_cloud_connection'] = 'ok'
-                health_status['qdrant_collections_count'] = len(collections.collections)
-            except Exception as e:
-                health_status['qdrant_cloud_connection'] = f'error: {str(e)}'
-        
-        return jsonify(health_status), 200
+            'upload_folder_exists': os.path.exists(UPLOAD_FOLDER)
+        }), 200
     except Exception as e:
         logger.exception("Health check failed")
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
 
-# Upload PDF route
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
+    """Upload and process PDF"""
     start_time = time.time()
     
     try:
         logger.info("=== Upload Request Started ===")
         
-        # Validate request format
+        # Validate request
         if 'file' not in request.files:
             logger.error("No file in request.files")
             return jsonify({'error': 'No file provided'}), 400
@@ -300,17 +386,15 @@ def upload_pdf():
             logger.error("GOOGLE_API_KEY not configured")
             return jsonify({'error': 'Server configuration error: Missing Google API key'}), 500
 
-        # Create or get RAG instance
-        logger.info("Getting RAG instance...")
+        # Create RAG instance
+        logger.info("Creating RAG instance...")
         with processing_lock:
             if session_id not in rag_instances:
                 logger.info(f"Creating new RAG instance for session {session_id}")
                 try:
-                    # Clean collection name for Qdrant
                     collection_name = f"collection_{session_id.replace('-', '_')}"
                     logger.info(f"Collection name: {collection_name}")
                     
-                    # Create RAG instance - ONLY pass collection_name
                     rag = PipelinedResearchPaperRAG(collection_name)
                     rag_instances[session_id] = rag
                     logger.info(f"RAG instance created for session {session_id}")
@@ -323,28 +407,24 @@ def upload_pdf():
                 logger.info(f"Using existing RAG instance for session {session_id}")
                 rag = rag_instances[session_id]
 
-        # Save uploaded file
+        # Save file
         logger.info("Saving uploaded file...")
         try:
             filename = secure_filename(f"{session_id}_{int(time.time())}_{file.filename}")
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(file_path)
             
-            # Verify file exists and has content
-            if not os.path.exists(file_path):
-                raise Exception("File was not saved successfully")
+            if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+                raise Exception("File was not saved properly")
                 
             file_size = os.path.getsize(file_path)
-            if file_size == 0:
-                raise Exception("Uploaded file is empty")
-                
             logger.info(f"File saved: {file_path} ({file_size} bytes)")
             
         except Exception as e:
             logger.error(f"File save failed: {e}")
             return jsonify({'error': f'Failed to save file: {str(e)}'}), 500
 
-        # Process the paper
+        # Process paper
         logger.info("Starting paper processing...")
         try:
             processing_start = time.time()
@@ -353,7 +433,7 @@ def upload_pdf():
             
             logger.info(f"Paper processing completed in {processing_time:.2f} seconds")
             
-            # Clean up uploaded file
+            # Clean up file
             try:
                 os.remove(file_path)
                 logger.info("Temporary file cleaned up")
@@ -375,7 +455,6 @@ def upload_pdf():
             logger.error(f"Paper processing failed: {e}")
             logger.error(traceback.format_exc())
             
-            # Cleanup on failure
             try:
                 os.remove(file_path)
             except:
@@ -388,15 +467,14 @@ def upload_pdf():
         logger.error(traceback.format_exc())
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-# Query route
 @app.route('/query', methods=['POST'])
 def query():
+    """Process query"""
     start_time = time.time()
     
     try:
         logger.info("=== Query Request Started ===")
         
-        # Parse JSON request
         try:
             data = request.get_json()
             if not data:
@@ -451,9 +529,9 @@ def query():
         logger.error(traceback.format_exc())
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-# Clear session route
 @app.route('/clear/<session_id>', methods=['DELETE'])
 def clear_session(session_id):
+    """Clear session"""
     try:
         logger.info(f"Clearing session: {session_id}")
         
@@ -463,7 +541,6 @@ def clear_session(session_id):
         if not rag:
             return jsonify({'error': 'Session not found'}), 404
 
-        # Cleanup
         try:
             if hasattr(rag, 'cleanup'):
                 rag.cleanup()
@@ -478,6 +555,11 @@ def clear_session(session_id):
         return jsonify({'error': f'Clear failed: {str(e)}'}), 500
 
 # Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    logger.warning(f"404 error: {request.url}")
+    return jsonify({'error': 'Page not found', 'url': request.url}), 404
+
 @app.errorhandler(413)
 def too_large(e):
     return jsonify({'error': 'File too large. Maximum size is 16MB.'}), 413
@@ -487,12 +569,21 @@ def internal_error(error):
     logger.error(f"Internal server error: {error}")
     return jsonify({'error': 'Internal server error'}), 500
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.error(f"Unhandled exception: {e}")
+    logger.error(traceback.format_exc())
+    return jsonify({'error': 'An unexpected error occurred'}), 500
 
-# Main entry point
+# Route listing for debugging
+@app.before_first_request
+def log_routes():
+    logger.info("=== Available Routes ===")
+    for rule in app.url_map.iter_rules():
+        logger.info(f"{rule.endpoint}: {rule.rule} {list(rule.methods)}")
+
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Starting Flask app on port {port}")
+    logger.info(f"Debug mode: {os.environ.get('FLASK_DEBUG', 'False')}")
     app.run(host="0.0.0.0", port=port, debug=False)
