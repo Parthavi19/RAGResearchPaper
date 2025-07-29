@@ -1,19 +1,46 @@
+# Core Flask dependencies
 Flask==2.3.3
-google-generativeai==0.8.3
-torch==2.4.0
-transformers==4.44.2
-numpy==1.26.4
-PyPDF2==3.0.1
 Werkzeug==3.0.4
 gunicorn==21.2.0
-qdrant-client==1.12.0
-python-dotenv==1.0.1
+
+# Google AI
+google-generativeai==0.8.3
+
+# Machine Learning
+torch==2.4.0
+transformers==4.44.2
 sentence-transformers==3.0.1
+numpy==1.26.4
+
+# PDF processing
+PyPDF2==3.0.1
+
+# Vector database
+qdrant-client==1.12.0
+
+# Utilities
+python-dotenv==1.0.1
+requests==2.32.3
+urllib3==2.2.2
+
+# ML model dependencies
 tokenizers==0.19.1
 huggingface-hub==0.24.5
 safetensors==0.4.4
-requests==2.32.3
-urllib3==2.2.2
+tqdm==4.66.4
+packaging==24.1
+pyyaml==6.0.1
+regex==2024.5.15
+filelock==3.15.4
+
+# System dependencies
 certifi==2024.7.4
 charset-normalizer==3.3.2
 idna==3.7
+click==8.1.7
+itsdangerous==2.2.0
+Jinja2==3.1.4
+MarkupSafe==2.1.5
+
+# For better error handling
+traceback2==1.4.0
