@@ -1,24 +1,29 @@
-# Use the official Python image
+# Use official Python base image
 FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Set working directory
+# Create working directory
 WORKDIR /app
 
-# Copy requirements
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirement files
 COPY requirements.txt .
 
-# Install dependencies
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
+# Install Python dependencies
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Copy project files
+# Copy the rest of your application code
 COPY . .
 
-# Command to run the app with Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "wsgi:app"]
+# Expose port (required by Cloud Run)
+EXPOSE 8080
 
-
+# Start the app using gunicorn with the config
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "wsgi:application"]
