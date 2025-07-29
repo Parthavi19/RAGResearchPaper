@@ -22,7 +22,7 @@ import multiprocessing as mp
 from functools import partial
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Global variables for lazy loading
@@ -35,22 +35,25 @@ def get_embedding_model():
     global _embedding_model, _tokenizer, _model_loading_error
     
     if _model_loading_error:
+        logger.error(f"Embedding model loading previously failed: {_model_loading_error}")
         raise _model_loading_error
     
     if _embedding_model is None:
         try:
-            logger.info("Loading embedding model...")
+            logger.info("Loading embedding model: sentence-transformers/all-MiniLM-L6-v2")
+            start_time = time.time()
             _tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
             _embedding_model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
             _embedding_model.eval()
-            logger.info("Embedding model loaded successfully")
+            logger.info(f"Embedding model loaded in {time.time() - start_time:.2f} seconds")
         except Exception as e:
             logger.warning(f"Failed to load all-MiniLM-L6-v2: {e}. Falling back to bert-base-uncased.")
             try:
+                start_time = time.time()
                 _tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
                 _embedding_model = AutoModel.from_pretrained('bert-base-uncased')
                 _embedding_model.eval()
-                logger.info("Fallback embedding model loaded successfully")
+                logger.info(f"Fallback embedding model loaded in {time.time() - start_time:.2f} seconds")
             except Exception as e:
                 logger.error(f"Failed to load any embedding model: {e}")
                 _model_loading_error = Exception(f"Could not load embedding model: {e}")
@@ -116,7 +119,7 @@ class PipelineStage:
             except Empty:
                 continue
             except Exception as e:
-                logger.error(f"Error in {self.name}: {e}")
+                logger.error(f"Error in {self.name}: {e}", exc_info=True)
                 # Send error data downstream
                 error_data = PipelineData(error=e, stage=self.name)
                 self.output_queue.put(error_data)
@@ -155,6 +158,7 @@ class PDFExtractionStage(PipelineStage):
             return data
             
         except Exception as e:
+            logger.error(f"Error in PDF extraction: {e}", exc_info=True)
             data.error = e
             data.stage = "pdf_extraction_error"
             return data
@@ -244,6 +248,7 @@ class ChunkingStage(PipelineStage):
             return data
             
         except Exception as e:
+            logger.error(f"Error in chunking: {e}", exc_info=True)
             data.error = e
             data.stage = "chunking_error"
             return data
@@ -319,6 +324,7 @@ class EmbeddingStage(PipelineStage):
             return data
             
         except Exception as e:
+            logger.error(f"Error in embedding: {e}", exc_info=True)
             data.error = e
             data.stage = "embedding_error"
             return data
@@ -399,6 +405,7 @@ class VectorStoreStage(PipelineStage):
             return data
             
         except Exception as e:
+            logger.error(f"Error in vector storage: {e}", exc_info=True)
             data.error = e
             data.stage = "storage_error"
             return data
@@ -446,20 +453,13 @@ class MetadataExtractionStage(PipelineStage):
             data.stage = "metadata_extracted"
             logger.info("Metadata extracted successfully")
             return data
-            
-        except Exception as e:
-            data.error = e
-            data.stage = "metadata_error"
-            return data
 
 class PipelinedResearchPaperRAG:
-    """Main RAG class with pipelined processing"""
+    """Main class for pipelined research paper RAG processing"""
     
     def __init__(self, api_key: str, qdrant_url: str, qdrant_api_key: str, 
                  chunk_size: int = 600, overlap: int = 50, max_workers: int = 4):
         logger.info("Initializing PipelinedResearchPaperRAG...")
-        
-        # Initialize Gemini
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(
             'gemini-1.5-flash',
@@ -469,145 +469,88 @@ class PipelinedResearchPaperRAG:
                 top_k=30,
             )
         )
-
-        # Initialize Qdrant client
-        self.qdrant_client = QdrantClient(
-            url=qdrant_url,
-            api_key=qdrant_api_key,
-        )
-        
+        self.qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.max_workers = max_workers
         
-        # Pipeline queues
-        self.pdf_queue = Queue()
-        self.chunking_queue = Queue()
-        self.embedding_queue = Queue()
-        self.storage_queue = Queue()
-        self.metadata_queue = Queue()
-        self.result_queue = Queue()
+        # Preload embedding model
+        try:
+            get_embedding_model()
+            logger.info("Embedding model preloaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to preload embedding model: {str(e)}", exc_info=True)
+            raise
         
-        # Pipeline stages
-        self.stages = []
+        # Initialize pipeline queues and stages
+        self.input_queue = Queue(maxsize=1)
+        self.output_queue = Queue(maxsize=1)
         
-        # Processing state
-        self.current_data = None
-        self.collection_name = None
+        self.pdf_extraction = PDFExtractionStage(self.input_queue, self.output_queue)
+        self.chunking = ChunkingStage(self.output_queue, self.output_queue)
+        self.embedding = EmbeddingStage(self.output_queue, self.output_queue)
+        self.vector_store = VectorStoreStage(self.output_queue, self.output_queue, self.qdrant_client)
+        self.metadata_extraction = MetadataExtractionStage(self.input_queue, self.output_queue)
+        
+        # Start pipeline stages
+        for stage in [self.pdf_extraction, self.chunking, self.embedding, self.vector_store, self.metadata_extraction]:
+            stage.start()
+        
+        self.current_data = PipelineData()
         self.paper_metadata = {}
         
-        # Thread pool for parallel operations
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    def load_research_paper(self, pdf_path: str) -> None:
+        """Load and process a research paper through the pipeline"""
+        logger.info(f"Loading research paper from: {pdf_path}")
         
-    def _setup_pipeline(self):
-        """Setup and start pipeline stages"""
-        # Create pipeline stages
-        pdf_stage = PDFExtractionStage(self.pdf_queue, self.chunking_queue)
-        chunking_stage = ChunkingStage(self.chunking_queue, self.embedding_queue, 
-                                     self.chunk_size, self.overlap)
-        embedding_stage = EmbeddingStage(self.embedding_queue, self.storage_queue)
-        storage_stage = VectorStoreStage(self.storage_queue, self.result_queue, self.qdrant_client)
+        self.current_data = PipelineData(pdf_path=pdf_path)
+        self.input_queue.put(self.current_data)
         
-        # Parallel metadata extraction
-        metadata_stage = MetadataExtractionStage(self.metadata_queue, Queue())
+        # Wait for pipeline completion
+        timeout = 300  # 5 minutes timeout
+        start_time = time.time()
         
-        self.stages = [pdf_stage, chunking_stage, embedding_stage, storage_stage, metadata_stage]
-        
-        # Start all stages
-        for stage in self.stages:
-            stage.start()
+        while time.time() - start_time < timeout:
+            try:
+                result = self.output_queue.get(timeout=1.0)
+                if result.error:
+                    logger.error(f"Pipeline failed at stage {result.stage}: {result.error}")
+                    raise result.error
+                if result.stage == "stored" and result.metadata:
+                    self.current_data = result
+                    self.paper_metadata = result.metadata
+                    logger.info("Pipeline completed successfully")
+                    break
+            except Empty:
+                continue
+                
+        if self.current_data.stage != "stored":
+            logger.error("Pipeline timed out or failed")
+            raise TimeoutError("Pipeline processing timed out or failed")
     
-    def _cleanup_pipeline(self):
-        """Stop and cleanup pipeline stages"""
-        for stage in self.stages:
+    def cleanup(self):
+        """Clean up resources"""
+        logger.info("Cleaning up PipelinedResearchPaperRAG resources...")
+        for stage in [self.pdf_extraction, self.chunking, self.embedding, self.vector_store, self.metadata_extraction]:
             stage.stop()
-        self.stages = []
+        if self.current_data and self.current_data.metadata and 'collection_name' in self.current_data.metadata:
+            try:
+                self.qdrant_client.delete_collection(self.current_data.metadata['collection_name'])
+            except Exception as e:
+                logger.warning(f"Error deleting collection: {e}")
     
-    def load_research_paper(self, pdf_path: str):
-        """Load and process research paper using pipeline"""
-        if not os.path.exists(pdf_path):
-            logger.error(f"PDF file not found: {pdf_path}")
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    def query(self, question: str, top_k: int = 5) -> Dict:
+        """Query the stored vectors and generate a response"""
+        if not self.current_data or not self.current_data.metadata or 'collection_name' not in self.current_data.metadata:
+            logger.error("No data loaded for querying")
+            raise ValueError("No data loaded. Please load a research paper first.")
         
-        logger.info(f"Loading research paper with pipeline: {pdf_path}")
+        collection_name = self.current_data.metadata['collection_name']
         
-        # Setup pipeline
-        self._setup_pipeline()
-        
-        try:
-            # Initialize pipeline data
-            pipeline_data = PipelineData(pdf_path=pdf_path)
-            
-            # Start processing
-            self.pdf_queue.put(pipeline_data)
-            
-            # Also send to metadata queue for parallel processing
-            self.metadata_queue.put(pipeline_data)
-            
-            # Wait for completion
-            result_data = self.result_queue.get(timeout=300)  # 5 minute timeout
-            
-            if result_data.error:
-                raise result_data.error
-            
-            # Store results
-            self.current_data = result_data
-            self.collection_name = result_data.metadata.get('collection_name')
-            self.paper_metadata = {
-                k: v for k, v in result_data.metadata.items() 
-                if k != 'collection_name'
-            }
-            
-            logger.info(f"Successfully loaded paper with {len(result_data.chunks)} chunks")
-            
-        except Exception as e:
-            logger.error(f"Error in pipeline processing: {e}")
-            raise
-        finally:
-            # Cleanup pipeline
-            self._cleanup_pipeline()
-    
-    def retrieve(self, query: str, top_k: int = 10) -> List[Tuple[ResearchChunk, float]]:
-        """Retrieve relevant chunks using pipelined query processing"""
-        if not self.collection_name:
-            logger.error("No document loaded")
-            raise ValueError("No document loaded")
-        
-        # Create query embedding using parallel processing
-        future = self.executor.submit(self._create_query_embedding, query)
-        query_embedding = future.result()
-        
-        # Search in Qdrant
-        search_results = self.qdrant_client.search(
-            collection_name=self.collection_name,
-            query_vector=query_embedding.tolist(),
-            limit=top_k * 2
-        )
-        
-        results = []
-        for result in search_results:
-            payload = result.payload
-            if "publication date" not in payload["text"].lower():
-                chunk = ResearchChunk(
-                    text=payload["text"],
-                    page_number=payload["page_number"],
-                    section=payload["section"],
-                    chunk_id=result.id
-                )
-                results.append((chunk, result.score))
-            
-            if len(results) >= top_k:
-                break
-        
-        logger.debug(f"Retrieved {len(results)} chunks for query: {query}")
-        return results
-    
-    def _create_query_embedding(self, query: str) -> np.ndarray:
-        """Create embedding for query text"""
+        # Generate query embedding
         embedding_model, tokenizer = get_embedding_model()
-        
-        query_inputs = tokenizer(
-            [query],
+        inputs = tokenizer(
+            question,
             padding=True,
             truncation=True,
             max_length=512,
@@ -615,146 +558,33 @@ class PipelinedResearchPaperRAG:
         )
         
         with torch.no_grad():
-            query_outputs = embedding_model(**query_inputs)
-            query_embedding = query_outputs.last_hidden_state[:, 0, :]
+            outputs = embedding_model(**inputs)
+            query_embedding = outputs.last_hidden_state[:, 0, :]
             query_embedding = torch.nn.functional.normalize(query_embedding, p=2, dim=1)
         
-        return query_embedding.cpu().numpy()[0]
-    
-    def generate_response(self, query: str, context_chunks: List[ResearchChunk]) -> str:
-        """Generate response using Gemini with parallel processing"""
-        context = "\n\n".join([f"[Section: {chunk.section}, Page {chunk.page_number}]\n{chunk.text}"
-                               for chunk in context_chunks])
+        query_embedding = query_embedding.cpu().numpy().tolist()[0]
         
-        prompt = f"""You are a research assistant specializing in academic papers. Answer the question based only on the provided context and metadata, using technical terms as they appear in the paper.
-
-PAPER METADATA:
-Title: {self.paper_metadata.get('title', 'Unknown')}
-Authors: {self.paper_metadata.get('authors', 'Unknown')}
-Abstract: {self.paper_metadata.get('abstract', 'Not extracted')}
-
-CONTEXT:
-{context}
-
-QUESTION: {query}
-
-INSTRUCTIONS:
-1. Provide a complete and detailed answer, including all relevant information from the context.
-2. Use bullet points for key points or lists to ensure clarity.
-3. Cite sections and pages from the context to support your answer.
-4. If information is missing, state: "Information not found in the provided context."
-5. Avoid speculation or external knowledge.
-6. Preserve technical terms and definitions from the paper.
-7. Do not truncate the response; provide the full answer regardless of length.
-
-ANSWER:"""
-        
-        # Use thread pool for parallel response generation with retries
-        future = self.executor.submit(self._generate_with_retries, prompt)
-        return future.result()
-    
-    def _generate_with_retries(self, prompt: str, retries: int = 3) -> str:
-        """Generate response with retry logic"""
-        for attempt in range(retries):
-            try:
-                response = self.model.generate_content(prompt)
-                return response.text.strip()
-            except google.api_core.exceptions.ResourceExhausted as e:
-                logger.warning(f"API quota exceeded on attempt {attempt + 1}: {e}")
-                if attempt < retries - 1:
-                    time.sleep(60)
-                else:
-                    logger.error(f"Failed to generate response after {retries} attempts: {e}")
-                    return f"Error generating response: API quota exceeded."
-            except Exception as e:
-                logger.error(f"Error generating response: {e}")
-                return f"Error generating response: {str(e)}"
-    
-    def calculate_simple_confidence(self, similarities: List[float]) -> float:
-        """Calculate a simple confidence score based on similarity scores."""
-        if not similarities:
-            return 0.0
-        
-        weights = [1.0 / (i + 1) for i in range(len(similarities))]
-        weighted_sum = sum(sim * weight for sim, weight in zip(similarities, weights))
-        total_weight = sum(weights)
-        
-        return min(100.0, (weighted_sum / total_weight) * 100)
-    
-    def query(self, question: str, top_k: int = 10) -> Dict:
-        """Process query with pipelined operations"""
-        if not question.strip():
-            logger.warning("Empty question provided")
-            return {
-                'answer': "Please provide a valid question.",
-                'sources': [],
-                'confidence': 0.0,
-                'metadata': {}
-            }
-        
-        # Use parallel processing for retrieval and response generation
-        retrieval_future = self.executor.submit(self.retrieve, question, top_k)
-        relevant_chunks = retrieval_future.result()
-        
-        if not relevant_chunks:
-            logger.info("No relevant chunks found")
-            return {
-                'answer': "No relevant information found in the paper.",
-                'sources': [],
-                'confidence': 0.0,
-                'metadata': self.paper_metadata
-            }
-        
-        # Parallel confidence calculation and response generation
-        similarities = [sim for _, sim in relevant_chunks]
-        confidence_future = self.executor.submit(self.calculate_simple_confidence, similarities)
-        response_future = self.executor.submit(
-            self.generate_response, question, [chunk for chunk, _ in relevant_chunks]
+        # Search in Qdrant
+        search_result = self.qdrant_client.search(
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            limit=top_k
         )
         
-        # Get results
-        confidence = confidence_future.result()
-        answer = response_future.result()
+        # Prepare context
+        context = "\n".join([f"Page {hit.payload['page_number']}, Section: {hit.payload['section']}:\n{hit.payload['text']}" for hit in search_result])
         
-        sources = [{
-            'rank': i + 1,
-            'section': chunk.section,
-            'page': chunk.page_number,
-            'text': chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text,
-            'relevance_score': float(round(sim, 3))
-        } for i, (chunk, sim) in enumerate(relevant_chunks)]
-        
-        result = {
-            'answer': answer,
-            'sources': sources,
-            'confidence': float(round(confidence, 1)),
-            'metadata': self.paper_metadata
-        }
-        
-        logger.info(f"Query processed successfully with confidence: {confidence}%")
-        return result
-    
-    def cleanup(self):
-        """Clean up resources"""
-        if self.collection_name:
-            try:
-                self.qdrant_client.delete_collection(collection_name=self.collection_name)
-                logger.info(f"Deleted Qdrant collection: {self.collection_name}")
-            except Exception as e:
-                logger.error(f"Error deleting collection: {e}")
-        
-        # Shutdown thread pool
-        self.executor.shutdown(wait=True)
-        
-        # Cleanup pipeline if still running
-        self._cleanup_pipeline()
-
-# Backward compatibility wrapper
-def ResearchPaperRAG(api_key: str, qdrant_url: str = None, qdrant_api_key: str = None, **kwargs):
-    """Backward compatibility wrapper"""
-    if qdrant_url and qdrant_api_key:
-        return PipelinedResearchPaperRAG(api_key, qdrant_url, qdrant_api_key, **kwargs)
-    else:
-        # Fallback to original implementation if Qdrant not configured
-        from specterragchain1 import ResearchPaperRAG as OriginalRAG
-        return OriginalRAG(api_key, **kwargs)
+        # Generate response using Gemini
+        try:
+            response = self.model.generate_content(f"Based on the following context:\n{context}\n\nQuestion: {question}")
+            return {
+                'answer': response.text,
+                'context': context,
+                'top_k_results': [(hit.payload['text'], hit.score) for hit in search_result]
+            }
+        except google.api_core.exceptions.GoogleAPIError as e:
+            logger.error(f"API error during query: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error during query generation: {e}")
+            raise
