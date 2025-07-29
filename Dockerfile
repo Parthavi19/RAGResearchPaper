@@ -37,9 +37,10 @@ USER appuser
 # Expose port
 EXPOSE 8080
 
-# Health check (wait 15 mins max for model load)
+# Health check (wait up to 15 minutes for model load)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=3 \
   CMD curl -f http://localhost:8080/health || exit 1
 
-# Start the application with Gunicorn
+# Start the application using Gunicorn with the wsgi.py entrypoint
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "wsgi:application"]
+
