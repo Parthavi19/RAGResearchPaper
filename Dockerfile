@@ -12,18 +12,17 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    libglib2.0-0 libsm6 libxrender1 libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy application files
-COPY . .
+# Copy files into the container
+COPY . /app
 
 # Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
 
-# Expose the port used by the application
+# Expose the port for Cloud Run
 EXPOSE 8080
 
-# Run the application using Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "wsgi:app"]
+# Start Gunicorn server
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "wsgi:application"]
