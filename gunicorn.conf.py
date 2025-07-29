@@ -3,15 +3,15 @@ import os
 # Binding
 bind = f"0.0.0.0:{os.environ.get('PORT', '8080')}"
 
-# Worker processes - Single worker for ML models to avoid multiple model loads
+# Worker processes - Single worker for ML models
 workers = 1
 worker_class = 'sync'
 worker_connections = 1000
 
-# Timeouts - Increased for model loading and Cloud Run
-timeout = 600  # 10 minutes for initial model loading
+# Timeouts - Increased for Cloud Run and ML model loading
+timeout = 900  # 15 minutes for initial model loading
 graceful_timeout = 120  # 2 minutes for graceful shutdown
-keepalive = 5  # Increased for Cloud Run's HTTP/2 keepalive
+keepalive = 5  # Matches Cloud Run's HTTP/2 keepalive
 
 # Worker lifecycle
 max_requests = 100  # Restart workers to prevent memory leaks
@@ -21,7 +21,7 @@ max_requests_jitter = 10
 preload_app = False  # Avoid loading ML models multiple times
 worker_tmp_dir = '/dev/shm'
 
-# Logging - Explicit paths for Cloud Run
+# Logging - Enhanced for Cloud Run debugging
 loglevel = 'info'
 accesslog = '-'  # stdout for Cloud Run
 errorlog = '-'   # stdout for Cloud Run
