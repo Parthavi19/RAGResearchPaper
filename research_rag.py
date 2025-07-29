@@ -3,7 +3,7 @@ import google.generativeai as genai
 import numpy as np
 import PyPDF2
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Generator
 from dataclasses import dataclass
 import logging
 from transformers import AutoTokenizer, AutoModel
@@ -14,6 +14,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 import uuid
 import sys
+import asyncio
+import concurrent.futures
+from queue import Queue, Empty
+from threading import Thread, Event
+import multiprocessing as mp
+from functools import partial
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -59,52 +65,399 @@ class ResearchChunk:
     section: str
     chunk_id: str
     embedding: np.ndarray = None
-    
-def regex_sentence_tokenize(text: str) -> List[str]:
-    """
-    Tokenize text into sentences using regex patterns.
-    Handles common abbreviations and edge cases.
-    """
-    # Common abbreviations that shouldn't end sentences
-    abbreviations = {
-        'dr', 'mr', 'mrs', 'ms', 'prof', 'inc', 'ltd', 'corp', 'co',
-        'vs', 'etc', 'fig', 'e.g', 'i.e', 'al', 'et', 'cf', 'p',
-        'pp', 'vol', 'no', 'ed', 'eds', 'min', 'max', 'approx',
-        'dept', 'univ', 'assoc', 'dev', 'eng', 'tech', 'sci',
-        'int', 'nat', 'comp', 'gen', 'spec', 'std', 'ref'
-    }
-    
-    # First, protect abbreviations by temporarily replacing periods
-    protected_text = text
-    for abbr in abbreviations:
-        # Match abbreviation followed by period (case insensitive)
-        pattern = rf'\b{re.escape(abbr)}\.'
-        replacement = f'{abbr}<PERIOD>'
-        protected_text = re.sub(pattern, replacement, protected_text, flags=re.IGNORECASE)
-    
-    # Handle decimal numbers (protect periods in numbers)
-    protected_text = re.sub(r'(\d+)\.(\d+)', r'\1<PERIOD>\2', protected_text)
-    
-    # Handle citations like (Smith et al. 2020)
-    protected_text = re.sub(r'\bet al\. (\d{4})\)', r'et al<PERIOD> \1)', protected_text)
-    
-    # Split on sentence-ending punctuation followed by whitespace and capital letter
-    # or end of string
-    sentence_pattern = r'[.!?]+(?:\s+(?=[A-Z])|$)'
-    sentences = re.split(sentence_pattern, protected_text)
-    
-    # Clean up and restore periods
-    cleaned_sentences = []
-    for sentence in sentences:
-        sentence = sentence.replace('<PERIOD>', '.').strip()
-        if sentence:  # Only add non-empty sentences
-            cleaned_sentences.append(sentence)
-    
-    return cleaned_sentences
 
-class ResearchPaperRAG:
-    def __init__(self, api_key: str, qdrant_url: str, qdrant_api_key: str, chunk_size: int = 600, overlap: int = 50):
-        logger.info("Initializing ResearchPaperRAG...")
+@dataclass
+class PipelineData:
+    """Data structure for pipeline stages"""
+    pdf_path: str = None
+    pages_text: List[Dict] = None
+    chunks: List[ResearchChunk] = None
+    embeddings: np.ndarray = None
+    metadata: Dict = None
+    stage: str = "init"
+    error: Exception = None
+
+class PipelineStage:
+    """Base class for pipeline stages"""
+    def __init__(self, name: str, input_queue: Queue, output_queue: Queue):
+        self.name = name
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self.stop_event = Event()
+        self.thread = None
+        
+    def start(self):
+        """Start the pipeline stage thread"""
+        self.thread = Thread(target=self._run, daemon=True)
+        self.thread.start()
+        
+    def stop(self):
+        """Stop the pipeline stage"""
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join()
+            
+    def _run(self):
+        """Main execution loop for the stage"""
+        while not self.stop_event.is_set():
+            try:
+                # Get data from input queue with timeout
+                data = self.input_queue.get(timeout=1.0)
+                if data is None:  # Poison pill
+                    break
+                    
+                # Process the data
+                processed_data = self.process(data)
+                
+                # Send to output queue
+                self.output_queue.put(processed_data)
+                self.input_queue.task_done()
+                
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in {self.name}: {e}")
+                # Send error data downstream
+                error_data = PipelineData(error=e, stage=self.name)
+                self.output_queue.put(error_data)
+                
+    def process(self, data: PipelineData) -> PipelineData:
+        """Override this method in subclasses"""
+        raise NotImplementedError
+
+class PDFExtractionStage(PipelineStage):
+    """Stage 1: Extract text from PDF"""
+    
+    def __init__(self, input_queue: Queue, output_queue: Queue):
+        super().__init__("PDF_Extraction", input_queue, output_queue)
+        
+    def process(self, data: PipelineData) -> PipelineData:
+        try:
+            logger.info(f"Extracting text from PDF: {data.pdf_path}")
+            pages_text = []
+            
+            with open(data.pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page_num, page in enumerate(pdf_reader.pages):
+                    text = page.extract_text()
+                    if text:
+                        cleaned_text = self.clean_text(text)
+                        section = self._infer_section(cleaned_text, page_num)
+                        pages_text.append({
+                            'text': cleaned_text,
+                            'page_number': page_num + 1,
+                            'section': section
+                        })
+            
+            data.pages_text = pages_text
+            data.stage = "pdf_extracted"
+            logger.info(f"Extracted {len(pages_text)} pages")
+            return data
+            
+        except Exception as e:
+            data.error = e
+            data.stage = "pdf_extraction_error"
+            return data
+    
+    def clean_text(self, text: str) -> str:
+        """Clean and normalize text."""
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+        text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
+        text = re.sub(r'Page\s+\d+', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+([,.!?;:])', r'\1', text)
+        return text.strip()
+
+    def _infer_section(self, text: str, page_num: int) -> str:
+        """Infer section type based on text content."""
+        text_lower = text.lower()
+        if page_num <= 2 and 'abstract' in text_lower:
+            return 'Abstract'
+        elif 'introduction' in text_lower[:200]:
+            return 'Introduction'
+        elif any(keyword in text_lower[:200] for keyword in ['method', 'experiment', 'approach']):
+            return 'Methodology'
+        elif any(keyword in text_lower[:200] for keyword in ['result', 'finding', 'evaluation']):
+            return 'Results'
+        elif any(keyword in text_lower[:200] for keyword in ['conclusion', 'discussion']):
+            return 'Conclusion'
+        return 'Other'
+
+class ChunkingStage(PipelineStage):
+    """Stage 2: Create text chunks"""
+    
+    def __init__(self, input_queue: Queue, output_queue: Queue, chunk_size: int = 600, overlap: int = 50):
+        super().__init__("Chunking", input_queue, output_queue)
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        
+    def process(self, data: PipelineData) -> PipelineData:
+        try:
+            if data.error:
+                return data
+                
+            logger.info("Creating text chunks...")
+            chunks = []
+            
+            for page_data in data.pages_text:
+                text = page_data['text']
+                page_num = page_data['page_number']
+                section = page_data['section']
+                
+                if not text.strip():
+                    continue
+                
+                # Use regex sentence tokenization
+                sentences = self.regex_sentence_tokenize(text)
+                
+                current_chunk = ""
+                
+                for sentence in sentences:
+                    potential_chunk = current_chunk + " " + sentence if current_chunk else sentence
+                    
+                    if len(potential_chunk) <= self.chunk_size:
+                        current_chunk = potential_chunk
+                    else:
+                        if current_chunk.strip():
+                            chunk_id = str(uuid.uuid4())
+                            chunks.append(ResearchChunk(
+                                text=current_chunk.strip(),
+                                page_number=page_num,
+                                section=section,
+                                chunk_id=chunk_id
+                            ))
+                        
+                        current_chunk = sentence[-self.overlap:] + " " + sentence if len(sentence) > self.overlap else sentence
+                
+                if current_chunk.strip():
+                    chunk_id = str(uuid.uuid4())
+                    chunks.append(ResearchChunk(
+                        text=current_chunk.strip(),
+                        page_number=page_num,
+                        section=section,
+                        chunk_id=chunk_id
+                    ))
+            
+            data.chunks = chunks
+            data.stage = "chunked"
+            logger.info(f"Created {len(chunks)} chunks")
+            return data
+            
+        except Exception as e:
+            data.error = e
+            data.stage = "chunking_error"
+            return data
+    
+    def regex_sentence_tokenize(self, text: str) -> List[str]:
+        """Tokenize text into sentences using regex patterns."""
+        abbreviations = {
+            'dr', 'mr', 'mrs', 'ms', 'prof', 'inc', 'ltd', 'corp', 'co',
+            'vs', 'etc', 'fig', 'e.g', 'i.e', 'al', 'et', 'cf', 'p',
+            'pp', 'vol', 'no', 'ed', 'eds', 'min', 'max', 'approx',
+            'dept', 'univ', 'assoc', 'dev', 'eng', 'tech', 'sci',
+            'int', 'nat', 'comp', 'gen', 'spec', 'std', 'ref'
+        }
+        
+        protected_text = text
+        for abbr in abbreviations:
+            pattern = rf'\b{re.escape(abbr)}\.'
+            replacement = f'{abbr}<PERIOD>'
+            protected_text = re.sub(pattern, replacement, protected_text, flags=re.IGNORECASE)
+        
+        protected_text = re.sub(r'(\d+)\.(\d+)', r'\1<PERIOD>\2', protected_text)
+        protected_text = re.sub(r'\bet al\. (\d{4})\)', r'et al<PERIOD> \1)', protected_text)
+        
+        sentence_pattern = r'[.!?]+(?:\s+(?=[A-Z])|$)'
+        sentences = re.split(sentence_pattern, protected_text)
+        
+        cleaned_sentences = []
+        for sentence in sentences:
+            sentence = sentence.replace('<PERIOD>', '.').strip()
+            if sentence:
+                cleaned_sentences.append(sentence)
+        
+        return cleaned_sentences
+
+class EmbeddingStage(PipelineStage):
+    """Stage 3: Create embeddings with batching"""
+    
+    def __init__(self, input_queue: Queue, output_queue: Queue, batch_size: int = 8):
+        super().__init__("Embedding", input_queue, output_queue)
+        self.batch_size = batch_size
+        self.embedding_model = None
+        self.tokenizer = None
+        
+    def process(self, data: PipelineData) -> PipelineData:
+        try:
+            if data.error:
+                return data
+                
+            # Lazy load embedding model
+            if self.embedding_model is None:
+                self.embedding_model, self.tokenizer = get_embedding_model()
+            
+            logger.info(f"Creating embeddings for {len(data.chunks)} chunks...")
+            chunks = data.chunks
+            texts = [f"{chunk.section}: {chunk.text}" for chunk in chunks]
+            embeddings = []
+
+            # Process in batches for better memory management
+            for i in range(0, len(texts), self.batch_size):
+                batch_texts = texts[i:i + self.batch_size]
+                batch_embeddings = self._create_batch_embeddings(batch_texts)
+                embeddings.append(batch_embeddings)
+
+            embeddings = np.vstack(embeddings)
+            
+            # Assign embeddings to chunks
+            for i, chunk in enumerate(chunks):
+                chunk.embedding = embeddings[i]
+            
+            data.embeddings = embeddings
+            data.stage = "embedded"
+            logger.info("Embeddings created successfully")
+            return data
+            
+        except Exception as e:
+            data.error = e
+            data.stage = "embedding_error"
+            return data
+    
+    def _create_batch_embeddings(self, batch_texts: List[str]) -> np.ndarray:
+        """Create embeddings for a batch of texts"""
+        inputs = self.tokenizer(
+            batch_texts,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors='pt'
+        )
+        
+        with torch.no_grad():
+            outputs = self.embedding_model(**inputs)
+            batch_embeddings = outputs.last_hidden_state[:, 0, :]
+            batch_embeddings = torch.nn.functional.normalize(batch_embeddings, p=2, dim=1)
+        
+        return batch_embeddings.cpu().numpy()
+
+class VectorStoreStage(PipelineStage):
+    """Stage 4: Store vectors in Qdrant"""
+    
+    def __init__(self, input_queue: Queue, output_queue: Queue, qdrant_client: QdrantClient):
+        super().__init__("VectorStore", input_queue, output_queue)
+        self.qdrant_client = qdrant_client
+        
+    def process(self, data: PipelineData) -> PipelineData:
+        try:
+            if data.error:
+                return data
+                
+            logger.info("Storing vectors in Qdrant...")
+            
+            # Generate unique collection name
+            collection_name = f"research_papers_{uuid.uuid4().hex[:8]}"
+            
+            # Create collection
+            embedding_dim = data.chunks[0].embedding.shape[0]
+            self.qdrant_client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=embedding_dim,
+                    distance=Distance.COSINE
+                )
+            )
+            
+            # Prepare points for batch insertion
+            points = []
+            for chunk in data.chunks:
+                points.append(PointStruct(
+                    id=chunk.chunk_id,
+                    vector=chunk.embedding.tolist(),
+                    payload={
+                        "text": chunk.text,
+                        "page_number": chunk.page_number,
+                        "section": chunk.section
+                    }
+                ))
+            
+            # Batch insert points
+            batch_size = 100
+            for i in range(0, len(points), batch_size):
+                batch_points = points[i:i + batch_size]
+                self.qdrant_client.upsert(
+                    collection_name=collection_name,
+                    points=batch_points
+                )
+            
+            # Store collection name in data
+            if not data.metadata:
+                data.metadata = {}
+            data.metadata['collection_name'] = collection_name
+            
+            data.stage = "stored"
+            logger.info(f"Stored {len(points)} vectors in collection: {collection_name}")
+            return data
+            
+        except Exception as e:
+            data.error = e
+            data.stage = "storage_error"
+            return data
+
+class MetadataExtractionStage(PipelineStage):
+    """Stage 5: Extract paper metadata (runs in parallel with other stages)"""
+    
+    def __init__(self, input_queue: Queue, output_queue: Queue):
+        super().__init__("MetadataExtraction", input_queue, output_queue)
+        
+    def process(self, data: PipelineData) -> PipelineData:
+        try:
+            if data.error or not data.pages_text:
+                return data
+                
+            logger.info("Extracting metadata...")
+            
+            first_page = data.pages_text[0]['text'] if data.pages_text else ""
+            abstract = ""
+            title = ""
+            authors = ""
+            
+            for page in data.pages_text[:2]:
+                text_lower = page['text'].lower()
+                if 'abstract' in text_lower:
+                    abstract_start = text_lower.find('abstract')
+                    abstract = page['text'][abstract_start:abstract_start + 300].strip()
+                
+                if page['page_number'] == 1:
+                    lines = page['text'].split('. ')
+                    title = lines[0].strip() if lines else ""
+                    authors = lines[1].strip() if len(lines) > 1 else ""
+            
+            metadata = {
+                'title': title,
+                'authors': authors,
+                'abstract': abstract
+            }
+            
+            if data.metadata:
+                data.metadata.update(metadata)
+            else:
+                data.metadata = metadata
+            
+            data.stage = "metadata_extracted"
+            logger.info("Metadata extracted successfully")
+            return data
+            
+        except Exception as e:
+            data.error = e
+            data.stage = "metadata_error"
+            return data
+
+class PipelinedResearchPaperRAG:
+    """Main RAG class with pipelined processing"""
+    
+    def __init__(self, api_key: str, qdrant_url: str, qdrant_api_key: str, 
+                 chunk_size: int = 600, overlap: int = 50, max_workers: int = 4):
+        logger.info("Initializing PipelinedResearchPaperRAG...")
         
         # Initialize Gemini
         genai.configure(api_key=api_key)
@@ -123,259 +476,106 @@ class ResearchPaperRAG:
             api_key=qdrant_api_key,
         )
         
-        # Generate unique collection name for this session
-        self.collection_name = f"research_papers_{uuid.uuid4().hex[:8]}"
-        
-        self.logger = logging.getLogger(__name__)
-        
-        # Don't load embedding model here - use lazy loading
-        self.embedding_model = None
-        self.tokenizer = None
-
-        self.chunks: List[ResearchChunk] = []
         self.chunk_size = chunk_size
         self.overlap = overlap
+        self.max_workers = max_workers
+        
+        # Pipeline queues
+        self.pdf_queue = Queue()
+        self.chunking_queue = Queue()
+        self.embedding_queue = Queue()
+        self.storage_queue = Queue()
+        self.metadata_queue = Queue()
+        self.result_queue = Queue()
+        
+        # Pipeline stages
+        self.stages = []
+        
+        # Processing state
+        self.current_data = None
+        self.collection_name = None
         self.paper_metadata = {}
-        self.api_quota_exceeded = False
-        self.collection_created = False
-
-    def _ensure_embedding_model(self):
-        """Ensure embedding model is loaded."""
-        if self.embedding_model is None:
-            self.embedding_model, self.tokenizer = get_embedding_model()
-
-    def clean_text(self, text: str) -> str:
-        """Clean and normalize text."""
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-        text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
-        text = re.sub(r'Page\s+\d+', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s+([,.!?;:])', r'\1', text)
-        return text.strip()
-
-    def extract_metadata_and_text(self, pdf_path: str) -> List[Dict]:
-        """Extract text and metadata from PDF."""
-        self.logger.info(f"Extracting text from PDF: {pdf_path}")
-        pages_text = []
-        try:
-            with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for page_num, page in enumerate(pdf_reader.pages):
-                    text = page.extract_text()
-                    if text:
-                        cleaned_text = self.clean_text(text)
-                        section = self._infer_section(cleaned_text, page_num)
-                        pages_text.append({
-                            'text': cleaned_text,
-                            'page_number': page_num + 1,
-                            'section': section
-                        })
-        except Exception as e:
-            self.logger.error(f"Error reading PDF: {e}")
-            raise
-        return pages_text
-
-    def _infer_section(self, text: str, page_num: int) -> str:
-        """Infer section type based on text content."""
-        text_lower = text.lower()
-        if page_num <= 2 and 'abstract' in text_lower:
-            return 'Abstract'
-        elif 'introduction' in text_lower[:200]:
-            return 'Introduction'
-        elif any(keyword in text_lower[:200] for keyword in ['method', 'experiment', 'approach']):
-            return 'Methodology'
-        elif any(keyword in text_lower[:200] for keyword in ['result', 'finding', 'evaluation']):
-            return 'Results'
-        elif any(keyword in text_lower[:200] for keyword in ['conclusion', 'discussion']):
-            return 'Conclusion'
-        return 'Other'
-
-    def chunk_text(self, pages_text: List[Dict]) -> List[ResearchChunk]:
-        """Split text into chunks using regex sentence tokenization."""
-        chunks = []
-        for page_data in pages_text:
-            text = page_data['text']
-            page_num = page_data['page_number']
-            section = page_data['section']
-            
-            if not text.strip():
-                continue
-            
-            # Use regex sentence tokenization
-            sentences = regex_sentence_tokenize(text)
-            
-            current_chunk = ""
-            
-            for sentence in sentences:
-                potential_chunk = current_chunk + " " + sentence if current_chunk else sentence
-                
-                if len(potential_chunk) <= self.chunk_size:
-                    current_chunk = potential_chunk
-                else:
-                    if current_chunk.strip():
-                        chunk_id = str(uuid.uuid4())
-                        chunks.append(ResearchChunk(
-                            text=current_chunk.strip(),
-                            page_number=page_num,
-                            section=section,
-                            chunk_id=chunk_id
-                        ))
-                    
-                    current_chunk = sentence[-self.overlap:] + " " + sentence if len(sentence) > self.overlap else sentence
-            
-            if current_chunk.strip():
-                chunk_id = str(uuid.uuid4())
-                chunks.append(ResearchChunk(
-                    text=current_chunk.strip(),
-                    page_number=page_num,
-                    section=section,
-                    chunk_id=chunk_id
-                ))
         
-        self.logger.info(f"Created {len(chunks)} chunks")
-        return chunks
-
-    def create_embeddings(self, chunks: List[ResearchChunk]) -> np.ndarray:
-        """Create embeddings for text chunks."""
-        self._ensure_embedding_model()
+        # Thread pool for parallel operations
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         
-        self.logger.info(f"Creating embeddings for {len(chunks)} chunks...")
-        texts = [f"{chunk.section}: {chunk.text}" for chunk in chunks]
-        embeddings = []
-
-        batch_size = 8
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            inputs = self.tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors='pt'
-            )
-            
-            with torch.no_grad():
-                outputs = self.embedding_model(**inputs)
-                batch_embeddings = outputs.last_hidden_state[:, 0, :]
-                batch_embeddings = torch.nn.functional.normalize(batch_embeddings, p=2, dim=1)
-            
-            embeddings.append(batch_embeddings.cpu().numpy())
-
-        embeddings = np.vstack(embeddings)
+    def _setup_pipeline(self):
+        """Setup and start pipeline stages"""
+        # Create pipeline stages
+        pdf_stage = PDFExtractionStage(self.pdf_queue, self.chunking_queue)
+        chunking_stage = ChunkingStage(self.chunking_queue, self.embedding_queue, 
+                                     self.chunk_size, self.overlap)
+        embedding_stage = EmbeddingStage(self.embedding_queue, self.storage_queue)
+        storage_stage = VectorStoreStage(self.storage_queue, self.result_queue, self.qdrant_client)
         
-        for i, chunk in enumerate(chunks):
-            chunk.embedding = embeddings[i]
-            
-        return embeddings
-
-    def create_qdrant_collection(self, embedding_dim: int):
-        """Create Qdrant collection for storing vectors."""
-        try:
-            self.qdrant_client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(
-                    size=embedding_dim,
-                    distance=Distance.COSINE
-                )
-            )
-            self.collection_created = True
-            self.logger.info(f"Created Qdrant collection: {self.collection_name}")
-        except Exception as e:
-            self.logger.error(f"Error creating Qdrant collection: {e}")
-            raise
-
-    def store_in_qdrant(self, chunks: List[ResearchChunk]):
-        """Store chunks and embeddings in Qdrant."""
-        if not self.collection_created:
-            embedding_dim = chunks[0].embedding.shape[0]
-            self.create_qdrant_collection(embedding_dim)
+        # Parallel metadata extraction
+        metadata_stage = MetadataExtractionStage(self.metadata_queue, Queue())
         
-        points = []
-        for chunk in chunks:
-            points.append(PointStruct(
-                id=chunk.chunk_id,
-                vector=chunk.embedding.tolist(),
-                payload={
-                    "text": chunk.text,
-                    "page_number": chunk.page_number,
-                    "section": chunk.section
-                }
-            ))
+        self.stages = [pdf_stage, chunking_stage, embedding_stage, storage_stage, metadata_stage]
         
-        self.qdrant_client.upsert(
-            collection_name=self.collection_name,
-            points=points
-        )
-        self.logger.info(f"Stored {len(points)} points in Qdrant")
-
-    def extract_metadata(self, pages_text: List[Dict]):
-        """Extract paper metadata."""
-        first_page = pages_text[0]['text'] if pages_text else ""
-        abstract = ""
-        title = ""
-        authors = ""
-        
-        for page in pages_text[:2]:
-            text_lower = page['text'].lower()
-            if 'abstract' in text_lower:
-                abstract_start = text_lower.find('abstract')
-                abstract = page['text'][abstract_start:abstract_start + 300].strip()
-            
-            if page['page_number'] == 1:
-                lines = page['text'].split('. ')
-                title = lines[0].strip() if lines else ""
-                authors = lines[1].strip() if len(lines) > 1 else ""
-        
-        self.paper_metadata = {
-            'title': title,
-            'authors': authors,
-            'abstract': abstract
-        }
-
+        # Start all stages
+        for stage in self.stages:
+            stage.start()
+    
+    def _cleanup_pipeline(self):
+        """Stop and cleanup pipeline stages"""
+        for stage in self.stages:
+            stage.stop()
+        self.stages = []
+    
     def load_research_paper(self, pdf_path: str):
-        """Load and process research paper."""
+        """Load and process research paper using pipeline"""
         if not os.path.exists(pdf_path):
-            self.logger.error(f"PDF file not found: {pdf_path}")
+            logger.error(f"PDF file not found: {pdf_path}")
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
         
-        self.logger.info(f"Loading research paper: {pdf_path}")
+        logger.info(f"Loading research paper with pipeline: {pdf_path}")
         
-        # Extract text and metadata
-        pages_text = self.extract_metadata_and_text(pdf_path)
-        self.extract_metadata(pages_text)
+        # Setup pipeline
+        self._setup_pipeline()
         
-        # Create chunks and embeddings
-        self.chunks = self.chunk_text(pages_text)
-        embeddings = self.create_embeddings(self.chunks)
-        
-        # Store in Qdrant
-        self.store_in_qdrant(self.chunks)
-        
-        self.logger.info(f"Loaded research paper with {len(self.chunks)} chunks")
-
+        try:
+            # Initialize pipeline data
+            pipeline_data = PipelineData(pdf_path=pdf_path)
+            
+            # Start processing
+            self.pdf_queue.put(pipeline_data)
+            
+            # Also send to metadata queue for parallel processing
+            self.metadata_queue.put(pipeline_data)
+            
+            # Wait for completion
+            result_data = self.result_queue.get(timeout=300)  # 5 minute timeout
+            
+            if result_data.error:
+                raise result_data.error
+            
+            # Store results
+            self.current_data = result_data
+            self.collection_name = result_data.metadata.get('collection_name')
+            self.paper_metadata = {
+                k: v for k, v in result_data.metadata.items() 
+                if k != 'collection_name'
+            }
+            
+            logger.info(f"Successfully loaded paper with {len(result_data.chunks)} chunks")
+            
+        except Exception as e:
+            logger.error(f"Error in pipeline processing: {e}")
+            raise
+        finally:
+            # Cleanup pipeline
+            self._cleanup_pipeline()
+    
     def retrieve(self, query: str, top_k: int = 10) -> List[Tuple[ResearchChunk, float]]:
-        """Retrieve relevant chunks from Qdrant."""
-        if not self.collection_created:
-            self.logger.error("No document loaded")
+        """Retrieve relevant chunks using pipelined query processing"""
+        if not self.collection_name:
+            logger.error("No document loaded")
             raise ValueError("No document loaded")
         
-        self._ensure_embedding_model()
-        
-        # Create query embedding
-        query_inputs = self.tokenizer(
-            [query],
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors='pt'
-        )
-        
-        with torch.no_grad():
-            query_outputs = self.embedding_model(**query_inputs)
-            query_embedding = query_outputs.last_hidden_state[:, 0, :]
-            query_embedding = torch.nn.functional.normalize(query_embedding, p=2, dim=1)
-        
-        query_embedding = query_embedding.cpu().numpy()[0]
+        # Create query embedding using parallel processing
+        future = self.executor.submit(self._create_query_embedding, query)
+        query_embedding = future.result()
         
         # Search in Qdrant
         search_results = self.qdrant_client.search(
@@ -399,11 +599,30 @@ class ResearchPaperRAG:
             if len(results) >= top_k:
                 break
         
-        self.logger.debug(f"Retrieved {len(results)} chunks for query: {query}")
+        logger.debug(f"Retrieved {len(results)} chunks for query: {query}")
         return results
-
+    
+    def _create_query_embedding(self, query: str) -> np.ndarray:
+        """Create embedding for query text"""
+        embedding_model, tokenizer = get_embedding_model()
+        
+        query_inputs = tokenizer(
+            [query],
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors='pt'
+        )
+        
+        with torch.no_grad():
+            query_outputs = embedding_model(**query_inputs)
+            query_embedding = query_outputs.last_hidden_state[:, 0, :]
+            query_embedding = torch.nn.functional.normalize(query_embedding, p=2, dim=1)
+        
+        return query_embedding.cpu().numpy()[0]
+    
     def generate_response(self, query: str, context_chunks: List[ResearchChunk]) -> str:
-        """Generate response using Gemini."""
+        """Generate response using Gemini with parallel processing"""
         context = "\n\n".join([f"[Section: {chunk.section}, Page {chunk.page_number}]\n{chunk.text}"
                                for chunk in context_chunks])
         
@@ -430,39 +649,42 @@ INSTRUCTIONS:
 
 ANSWER:"""
         
-        retries = 3
+        # Use thread pool for parallel response generation with retries
+        future = self.executor.submit(self._generate_with_retries, prompt)
+        return future.result()
+    
+    def _generate_with_retries(self, prompt: str, retries: int = 3) -> str:
+        """Generate response with retry logic"""
         for attempt in range(retries):
             try:
                 response = self.model.generate_content(prompt)
                 return response.text.strip()
             except google.api_core.exceptions.ResourceExhausted as e:
-                self.logger.warning(f"API quota exceeded on attempt {attempt + 1}: {e}")
-                self.api_quota_exceeded = True
+                logger.warning(f"API quota exceeded on attempt {attempt + 1}: {e}")
                 if attempt < retries - 1:
                     time.sleep(60)
                 else:
-                    self.logger.error(f"Failed to generate response after {retries} attempts: {e}")
+                    logger.error(f"Failed to generate response after {retries} attempts: {e}")
                     return f"Error generating response: API quota exceeded."
             except Exception as e:
-                self.logger.error(f"Error generating response: {e}")
+                logger.error(f"Error generating response: {e}")
                 return f"Error generating response: {str(e)}"
-
+    
     def calculate_simple_confidence(self, similarities: List[float]) -> float:
         """Calculate a simple confidence score based on similarity scores."""
         if not similarities:
             return 0.0
         
-        # Use weighted average with higher weight for top results
         weights = [1.0 / (i + 1) for i in range(len(similarities))]
         weighted_sum = sum(sim * weight for sim, weight in zip(similarities, weights))
         total_weight = sum(weights)
         
         return min(100.0, (weighted_sum / total_weight) * 100)
-
+    
     def query(self, question: str, top_k: int = 10) -> Dict:
-        """Process query and return results."""
+        """Process query with pipelined operations"""
         if not question.strip():
-            self.logger.warning("Empty question provided")
+            logger.warning("Empty question provided")
             return {
                 'answer': "Please provide a valid question.",
                 'sources': [],
@@ -470,10 +692,12 @@ ANSWER:"""
                 'metadata': {}
             }
         
-        relevant_chunks = self.retrieve(question, top_k)
+        # Use parallel processing for retrieval and response generation
+        retrieval_future = self.executor.submit(self.retrieve, question, top_k)
+        relevant_chunks = retrieval_future.result()
         
         if not relevant_chunks:
-            self.logger.info("No relevant chunks found")
+            logger.info("No relevant chunks found")
             return {
                 'answer': "No relevant information found in the paper.",
                 'sources': [],
@@ -481,11 +705,16 @@ ANSWER:"""
                 'metadata': self.paper_metadata
             }
         
-        # Calculate confidence based on similarity scores
+        # Parallel confidence calculation and response generation
         similarities = [sim for _, sim in relevant_chunks]
-        confidence = self.calculate_simple_confidence(similarities)
+        confidence_future = self.executor.submit(self.calculate_simple_confidence, similarities)
+        response_future = self.executor.submit(
+            self.generate_response, question, [chunk for chunk, _ in relevant_chunks]
+        )
         
-        answer = self.generate_response(question, [chunk for chunk, _ in relevant_chunks])
+        # Get results
+        confidence = confidence_future.result()
+        answer = response_future.result()
         
         sources = [{
             'rank': i + 1,
@@ -502,14 +731,30 @@ ANSWER:"""
             'metadata': self.paper_metadata
         }
         
-        self.logger.info(f"Query processed successfully with confidence: {confidence}%")
+        logger.info(f"Query processed successfully with confidence: {confidence}%")
         return result
-
+    
     def cleanup(self):
-        """Clean up Qdrant collection."""
-        if self.collection_created:
+        """Clean up resources"""
+        if self.collection_name:
             try:
                 self.qdrant_client.delete_collection(collection_name=self.collection_name)
-                self.logger.info(f"Deleted Qdrant collection: {self.collection_name}")
+                logger.info(f"Deleted Qdrant collection: {self.collection_name}")
             except Exception as e:
-                self.logger.error(f"Error deleting collection: {e}")
+                logger.error(f"Error deleting collection: {e}")
+        
+        # Shutdown thread pool
+        self.executor.shutdown(wait=True)
+        
+        # Cleanup pipeline if still running
+        self._cleanup_pipeline()
+
+# Backward compatibility wrapper
+def ResearchPaperRAG(api_key: str, qdrant_url: str = None, qdrant_api_key: str = None, **kwargs):
+    """Backward compatibility wrapper"""
+    if qdrant_url and qdrant_api_key:
+        return PipelinedResearchPaperRAG(api_key, qdrant_url, qdrant_api_key, **kwargs)
+    else:
+        # Fallback to original implementation if Qdrant not configured
+        from specterragchain1 import ResearchPaperRAG as OriginalRAG
+        return OriginalRAG(api_key, **kwargs)
