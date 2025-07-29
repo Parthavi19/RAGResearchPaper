@@ -3,40 +3,50 @@ import os
 # Binding
 bind = f"0.0.0.0:{os.environ.get('PORT', '8080')}"
 
-# Worker processes
-workers = 1  # Reduced due to memory-intensive ML models
-worker_class = 'sync'  # Use sync workers instead of threads for stability
+# Worker processes - CRITICAL: Use only 1 worker for ML models
+workers = 1
+worker_class = 'sync'
 worker_connections = 1000
 
-# Timeouts
-timeout = 300  # 5 minutes for model loading and processing
+# Timeouts - Increased for model loading
+timeout = 600  # 10 minutes for initial model loading
+graceful_timeout = 120  # 2 minutes for graceful shutdown
 keepalive = 2
-max_requests = 1000
-max_requests_jitter = 50
+
+# Worker lifecycle
+max_requests = 100  # Restart workers periodically to prevent memory leaks
+max_requests_jitter = 10
 
 # Memory management
-preload_app = True  # Preload app to share model memory
-worker_tmp_dir = '/dev/shm'  # Use RAM for tmp files
+preload_app = False  # Don't preload to avoid model loading issues
+worker_tmp_dir = '/dev/shm'
 
 # Logging
 loglevel = 'info'
 accesslog = '-'
 errorlog = '-'
-access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s'
+capture_output = True
+enable_stdio_inheritance = True
 
 # Security
 limit_request_line = 4094
 limit_request_fields = 100
 limit_request_field_size = 8190
 
+def on_starting(server):
+    server.log.info("Gunicorn server is starting")
+
 def when_ready(server):
-    server.log.info("Server is ready. Spawning workers")
+    server.log.info("Gunicorn server is ready. Spawning workers")
 
 def worker_int(worker):
-    worker.log.info("worker received INT or QUIT signal")
+    worker.log.info("Worker received INT or QUIT signal")
 
 def pre_fork(server, worker):
-    server.log.info("Worker spawned (pid: %s)", worker.pid)
+    server.log.info("Worker spawning (pid: %s)", worker.pid)
 
 def post_fork(server, worker):
     server.log.info("Worker spawned (pid: %s)", worker.pid)
+
+def worker_abort(worker):
+    worker.log.info("Worker aborted (pid: %s)", worker.pid)
