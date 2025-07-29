@@ -47,6 +47,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=3 \
 
 # Start the application with Gunicorn
 CMD ["gunicorn", "--config", "gunicorn.conf.py", "wsgi:application"]
+# Expose application port
+EXPOSE 8080
+
+# Health check - Extended start-period for ML model loading
+HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+# Start the application with Gunicorn
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "wsgi:application"]
 
 # Start the application with Gunicorn
 CMD ["gunicorn", "--config", "gunicorn.conf.py", "wsgi:application"]
