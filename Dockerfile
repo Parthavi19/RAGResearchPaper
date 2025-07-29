@@ -18,8 +18,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy app source
-COPY . .
+# Copy app source explicitly
+COPY app.py wsgi.py gunicorn.conf.py pipelined_research_rag.py requirements.txt ./
+COPY uploads/ ./uploads/
 
 # Create required directories
 RUN mkdir -p /app/uploads /app/local_qdrant
@@ -38,10 +39,9 @@ USER appuser
 # Expose application port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+# Health check - Increased start-period for ML model loading
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
   CMD curl -f http://localhost:8080/health || exit 1
 
 # Start the application with Gunicorn
 CMD ["gunicorn", "--config", "gunicorn.conf.py", "wsgi:application"]
-
