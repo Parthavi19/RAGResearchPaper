@@ -24,7 +24,7 @@ query_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 # Configuration
 API_KEY = os.environ.get('GOOGLE_API_KEY', "AIzaSyAVzwqMt0edserFCtiGHlb5g2iOkxZf2SA")
 QDRANT_URL = os.environ.get('QDRANT_URL', 'http://localhost:6333')
-QDRANT_API_KEY = os.environ.get('QDRANT_API_KEY', 'your-qdrant-api-key')
+QDRANT_API_KEY = os.environ.get('QDRANT_API_KEY', 'ec3fdef1-a184-42d0-ad80-d8c270b958e4|1Ry9e3hLdqmlUPnK1SoHWU6Ie0vpJMfRPygv7F3qGz3UC6Tv0T3r7Q')
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
