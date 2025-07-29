@@ -14,13 +14,13 @@
     <input type="text" id="sessionId" placeholder="Enter session ID (or leave blank)" class="border p-2 mb-4 w-full">
 
     <!-- Upload Form -->
-    <form id="uploadForm" class="mb-4">
+    <form id="uploadForm" class="mb-4" enctype="multipart/form-data" method="POST">
       <input type="file" id="fileInput" accept=".pdf,.txt" class="mb-2" required />
       <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded">Upload Document</button>
     </form>
 
     <!-- Query Form -->
-    <form id="queryForm">
+    <form id="queryForm" class="mb-4">
       <input type="text" id="queryInput" placeholder="Enter your question..." class="border p-2 w-full mb-2" required />
       <button type="submit" class="bg-green-500 text-white px-4 py-2 rounded">Ask</button>
     </form>
@@ -41,8 +41,13 @@
     uploadForm.addEventListener('submit', async (e) => {
       e.preventDefault();
 
-      const sessionId = sessionIdInput.value.trim() || crypto.randomUUID();  // Auto-generate if blank
-      sessionIdInput.value = sessionId;  // Persist the generated sessionId
+      if (fileInput.files.length === 0) {
+        resultContent.innerHTML = `<p class="text-red-500">Please select a file to upload.</p>`;
+        return;
+      }
+
+      const sessionId = sessionIdInput.value.trim() || crypto.randomUUID();
+      sessionIdInput.value = sessionId;
 
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
@@ -54,11 +59,16 @@
           body: formData,
         });
 
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(errorText);
+        }
+
         const result = await response.json();
         resultContent.innerHTML = `<p class="text-green-600 font-semibold">${result.message}</p>`;
       } catch (err) {
-        console.error(err);
-        resultContent.innerHTML = `<p class="text-red-500">Upload failed. Please try again.</p>`;
+        console.error('Upload error:', err);
+        resultContent.innerHTML = `<p class="text-red-500">Upload failed: ${err.message}</p>`;
       }
     });
 
@@ -94,8 +104,8 @@
           `;
         }
       } catch (err) {
-        console.error(err);
-        resultContent.innerHTML = `<p class="text-red-500">Query failed. Please try again.</p>`;
+        console.error('Query error:', err);
+        resultContent.innerHTML = `<p class="text-red-500">Query failed: ${err.message}</p>`;
       }
     });
   </script>
