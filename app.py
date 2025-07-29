@@ -19,30 +19,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Import RAG after logging setup with timeout protection
-def safe_import_rag():
-    """Safely import RAG with timeout"""
-    try:
-        logger.info("Importing PipelinedResearchPaperRAG...")
-        from pipelined_research_rag import PipelinedResearchPaperRAG
-        logger.info("Successfully imported PipelinedResearchPaperRAG")
-        return PipelinedResearchPaperRAG
-    except Exception as e:
-        logger.error(f"Failed to import PipelinedResearchPaperRAG: {e}")
-        logger.error(traceback.format_exc())
-        # Create a dummy class for testing
-        class DummyRAG:
-            def __init__(self, collection_name):
-                self.collection_name = collection_name
-            def load_research_paper(self, path):
-                return {"status": "dummy mode - RAG import failed"}
-            def query(self, question):
-                return "RAG system not available - check server logs"
-        return DummyRAG
-
-# Import with error handling
-PipelinedResearchPaperRAG = safe_import_rag()
-
 # Create Flask app
 app = Flask(__name__)
 
@@ -64,6 +40,27 @@ logger.info(f"Environment check - GOOGLE_API_KEY present: {bool(GOOGLE_API_KEY)}
 # Session state
 rag_instances = {}
 processing_lock = threading.Lock()
+
+# Lazy import for RAG to avoid startup delay
+def get_rag_instance(collection_name):
+    """Lazily import and initialize RAG"""
+    try:
+        logger.info("Importing PipelinedResearchPaperRAG...")
+        from pipelined_research_rag import PipelinedResearchPaperRAG
+        logger.info("Successfully imported PipelinedResearchPaperRAG")
+        return PipelinedResearchPaperRAG(collection_name)
+    except Exception as e:
+        logger.error(f"Failed to import PipelinedResearchPaperRAG: {e}")
+        logger.error(traceback.format_exc())
+        # Create a dummy class for testing
+        class DummyRAG:
+            def __init__(self, collection_name):
+                self.collection_name = collection_name
+            def load_research_paper(self, path):
+                return {"status": "dummy mode - RAG import failed"}
+            def query(self, question):
+                return "RAG system not available - check server logs"
+        return DummyRAG(collection_name)
 
 # HTML template as string
 INDEX_HTML = """
@@ -391,7 +388,7 @@ def upload_pdf():
             logger.error("GOOGLE_API_KEY not configured")
             return jsonify({'error': 'Server configuration error: Missing Google API key'}), 500
 
-        # Create RAG instance
+        # Create RAG instance lazily
         logger.info("Creating RAG instance...")
         with processing_lock:
             if session_id not in rag_instances:
@@ -400,7 +397,7 @@ def upload_pdf():
                     collection_name = f"collection_{session_id.replace('-', '_')}"
                     logger.info(f"Collection name: {collection_name}")
                     
-                    rag = PipelinedResearchPaperRAG(collection_name)
+                    rag = get_rag_instance(collection_name)
                     rag_instances[session_id] = rag
                     logger.info(f"RAG instance created for session {session_id}")
                     
