@@ -46,6 +46,11 @@ PipelinedResearchPaperRAG = safe_import_rag()
 # Create Flask app
 app = Flask(__name__)
 
+# Log routes at app initialization
+logger.info("=== Available Routes ===")
+for rule in app.url_map.iter_rules():
+    logger.info(f"{rule.endpoint}: {rule.rule} {list(rule.methods)}")
+
 # Upload folder
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -574,13 +579,6 @@ def handle_exception(e):
     logger.error(f"Unhandled exception: {e}")
     logger.error(traceback.format_exc())
     return jsonify({'error': 'An unexpected error occurred'}), 500
-
-# Route listing for debugging
-@app.before_first_request
-def log_routes():
-    logger.info("=== Available Routes ===")
-    for rule in app.url_map.iter_rules():
-        logger.info(f"{rule.endpoint}: {rule.rule} {list(rule.methods)}")
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
