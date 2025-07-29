@@ -11,11 +11,11 @@ from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+# Enable debug logging
+logging.basicConfig(level=logging.DEBUG)
+
 # Load environment variables
 load_dotenv()
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
@@ -40,6 +40,8 @@ def upload_pdf():
     file = request.files.get('file')
     session_id = request.form.get('session_id')
 
+    logging.debug(f"Received upload - session_id: {session_id}, file: {file.filename if file else 'None'}")
+
     if not file or not session_id:
         return jsonify({'error': 'Missing file or session_id'}), 400
 
@@ -61,8 +63,11 @@ def upload_pdf():
     file_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(file_path)
 
+    logging.debug(f"File saved to: {file_path}")
+
     try:
         metadata = rag.load_research_paper(file_path)
+        logging.debug(f"Metadata loaded: {metadata}")
         return jsonify({
             'message': 'Paper uploaded and indexed successfully.',
             'session_id': session_id,
@@ -78,6 +83,8 @@ def query():
     data = request.json
     question = data.get('question')
     session_id = data.get('session_id')
+
+    logging.debug(f"Query received - session_id: {session_id}, question: {question}")
 
     if not question or not session_id:
         return jsonify({'error': 'Missing question or session_id'}), 400
@@ -131,4 +138,3 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
