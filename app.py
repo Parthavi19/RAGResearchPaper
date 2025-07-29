@@ -384,6 +384,6 @@ def cleanup_on_exit():
 atexit.register(cleanup_on_exit)
 
 # Remove local development block for Cloud Run
-# if __name__ == '__main__':
-#     logger.info("Starting pipelined RAG application...")
-#     app.run(host='0.0.0.0', port=8080, debug=True)
+ if __name__ == '__main__':
+     logger.info("Starting pipelined RAG application...")
+     app.run(host='0.0.0.0', port=8080, debug=True)
