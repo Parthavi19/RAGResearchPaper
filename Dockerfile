@@ -21,8 +21,8 @@ COPY . /app
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-# Expose the port your app runs on
+# Expose the port for Cloud Run
 EXPOSE 8080
 
-# Run the app using Gunicorn
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "wsgi:application"]
+# Start Gunicorn server
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "wsgi:app"]
