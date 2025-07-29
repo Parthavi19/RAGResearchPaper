@@ -6,7 +6,6 @@ import threading
 import traceback
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
-from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 # Load environment variables first
@@ -20,14 +19,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Import RAG after logging setup
-try:
-    from pipelined_research_rag import PipelinedResearchPaperRAG
-    logger.info("Successfully imported PipelinedResearchPaperRAG")
-except Exception as e:
-    logger.error(f"Failed to import PipelinedResearchPaperRAG: {e}")
-    logger.error(traceback.format_exc())
-    sys.exit(1)
+# Import RAG after logging setup with timeout protection
+def safe_import_rag():
+    """Safely import RAG with timeout"""
+    try:
+        logger.info("Importing PipelinedResearchPaperRAG...")
+        from pipelined_research_rag import PipelinedResearchPaperRAG
+        logger.info("Successfully imported PipelinedResearchPaperRAG")
+        return PipelinedResearchPaperRAG
+    except Exception as e:
+        logger.error(f"Failed to import PipelinedResearchPaperRAG: {e}")
+        logger.error(traceback.format_exc())
+        raise
+
+# Import with error handling
+PipelinedResearchPaperRAG = safe_import_rag()
 
 # Create Flask app
 app = Flask(__name__)
@@ -41,37 +47,6 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 # Environment variables
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 logger.info(f"Environment check - GOOGLE_API_KEY present: {bool(GOOGLE_API_KEY)}")
-
-# Test imports and dependencies
-try:
-    import google.generativeai as genai
-    logger.info("Successfully imported google.generativeai")
-except Exception as e:
-    logger.error(f"Failed to import google.generativeai: {e}")
-
-try:
-    import torch
-    logger.info(f"PyTorch version: {torch.__version__}")
-except Exception as e:
-    logger.error(f"Failed to import torch: {e}")
-
-try:
-    from transformers import AutoTokenizer, AutoModel
-    logger.info("Successfully imported transformers")
-except Exception as e:
-    logger.error(f"Failed to import transformers: {e}")
-
-try:
-    from qdrant_client import QdrantClient
-    logger.info("Successfully imported qdrant_client")
-except Exception as e:
-    logger.error(f"Failed to import qdrant_client: {e}")
-
-try:
-    import PyPDF2
-    logger.info("Successfully imported PyPDF2")
-except Exception as e:
-    logger.error(f"Failed to import PyPDF2: {e}")
 
 # Session state
 rag_instances = {}
@@ -91,19 +66,24 @@ INDEX_HTML = """
   <div class="bg-white shadow-lg rounded-lg p-6 max-w-xl w-full">
     <h1 class="text-2xl font-bold mb-4 text-center">RAG Bot</h1>
 
+    <!-- Status indicator -->
+    <div id="status" class="mb-4 p-2 rounded text-center bg-blue-100 text-blue-800">
+      Ready to upload documents
+    </div>
+
     <!-- Session ID Input -->
-    <input type="text" id="sessionId" placeholder="Enter session ID (or leave blank)" class="border p-2 mb-4 w-full">
+    <input type="text" id="sessionId" placeholder="Session ID (auto-generated if empty)" class="border p-2 mb-4 w-full">
 
     <!-- Upload Form -->
     <form id="uploadForm" class="mb-4" enctype="multipart/form-data" method="POST">
       <input type="file" id="fileInput" accept=".pdf" class="mb-2" required />
-      <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded">Upload Document</button>
+      <button type="submit" id="uploadBtn" class="bg-blue-500 text-white px-4 py-2 rounded w-full">Upload Document</button>
     </form>
 
     <!-- Query Form -->
     <form id="queryForm" class="mb-4">
       <input type="text" id="queryInput" placeholder="Enter your question..." class="border p-2 w-full mb-2" required />
-      <button type="submit" class="bg-green-500 text-white px-4 py-2 rounded">Ask</button>
+      <button type="submit" id="queryBtn" class="bg-green-500 text-white px-4 py-2 rounded w-full">Ask Question</button>
     </form>
 
     <!-- Results -->
@@ -117,13 +97,39 @@ INDEX_HTML = """
     const queryInput = document.getElementById('queryInput');
     const resultContent = document.getElementById('result');
     const sessionIdInput = document.getElementById('sessionId');
+    const statusDiv = document.getElementById('status');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const queryBtn = document.getElementById('queryBtn');
+
+    function setStatus(message, type = 'info') {
+      const colors = {
+        info: 'bg-blue-100 text-blue-800',
+        success: 'bg-green-100 text-green-800',
+        error: 'bg-red-100 text-red-800',
+        warning: 'bg-yellow-100 text-yellow-800'
+      };
+      statusDiv.className = `mb-4 p-2 rounded text-center ${colors[type]}`;
+      statusDiv.textContent = message;
+    }
+
+    function setLoading(loading) {
+      uploadBtn.disabled = loading;
+      queryBtn.disabled = loading;
+      if (loading) {
+        uploadBtn.textContent = 'Processing...';
+        queryBtn.textContent = 'Processing...';
+      } else {
+        uploadBtn.textContent = 'Upload Document';
+        queryBtn.textContent = 'Ask Question';
+      }
+    }
 
     // Upload document
     uploadForm.addEventListener('submit', async (e) => {
       e.preventDefault();
 
       if (fileInput.files.length === 0) {
-        resultContent.innerHTML = `<p class="text-red-500">Please select a file to upload.</p>`;
+        setStatus('Please select a PDF file to upload', 'error');
         return;
       }
 
@@ -134,7 +140,8 @@ INDEX_HTML = """
       formData.append('file', fileInput.files[0]);
       formData.append('session_id', sessionId);
 
-      resultContent.innerHTML = `<p class="text-blue-500">Uploading and processing...</p>`;
+      setStatus('Uploading and processing document...', 'info');
+      setLoading(true);
 
       try {
         const response = await fetch('/upload', {
@@ -148,10 +155,20 @@ INDEX_HTML = """
           throw new Error(result.error || 'Upload failed');
         }
 
-        resultContent.innerHTML = `<p class="text-green-600 font-semibold">${result.message}</p>`;
+        setStatus('Document uploaded successfully! You can now ask questions.', 'success');
+        resultContent.innerHTML = `
+          <div class="bg-green-50 border border-green-200 rounded p-4">
+            <h3 class="font-semibold text-green-800">Upload Complete</h3>
+            <p class="text-sm text-green-600 mt-1">${result.message}</p>
+            <p class="text-xs text-gray-500 mt-2">Session: ${sessionId}</p>
+          </div>
+        `;
       } catch (err) {
         console.error('Upload error:', err);
-        resultContent.innerHTML = `<p class="text-red-500">Upload failed: ${err.message}</p>`;
+        setStatus('Upload failed. Please try again.', 'error');
+        resultContent.innerHTML = `<div class="bg-red-50 border border-red-200 rounded p-4 text-red-800">Error: ${err.message}</div>`;
+      } finally {
+        setLoading(false);
       }
     });
 
@@ -163,11 +180,12 @@ INDEX_HTML = """
       const queryInputText = queryInput.value.trim();
 
       if (!sessionId) {
-        resultContent.innerHTML = `<p class="text-red-500">Please upload a document first or enter a session ID.</p>`;
+        setStatus('Please upload a document first', 'error');
         return;
       }
 
-      resultContent.innerHTML = `<p class="text-blue-500">Processing query...</p>`;
+      setStatus('Processing your question...', 'info');
+      setLoading(true);
 
       try {
         const response = await fetch('/query', {
@@ -182,19 +200,28 @@ INDEX_HTML = """
           throw new Error(result.error || 'Query failed');
         }
 
+        setStatus('Question answered successfully!', 'success');
         resultContent.innerHTML = `
-          <div class="bg-gray-50 p-4 rounded">
-            <p><strong>Question:</strong> ${queryInputText}</p>
-            <p><strong>Answer:</strong> ${result.answer}</p>
-            <p class="text-sm text-gray-600 mt-2">
-              <strong>Session:</strong> ${sessionId} | 
-              <strong>Query Time:</strong> ${result.performance?.query_time?.toFixed(2) || "?"} seconds
-            </p>
+          <div class="bg-gray-50 border rounded p-4">
+            <h3 class="font-semibold text-gray-800 mb-2">Question:</h3>
+            <p class="text-gray-700 mb-4">${queryInputText}</p>
+            <h3 class="font-semibold text-gray-800 mb-2">Answer:</h3>
+            <div class="text-gray-700 mb-4 whitespace-pre-wrap">${result.answer}</div>
+            <div class="text-xs text-gray-500 border-t pt-2">
+              Response time: ${result.performance?.query_time?.toFixed(2) || "?"} seconds
+            </div>
           </div>
         `;
+        
+        // Clear the query input
+        queryInput.value = '';
+        
       } catch (err) {
         console.error('Query error:', err);
-        resultContent.innerHTML = `<p class="text-red-500">Query failed: ${err.message}</p>`;
+        setStatus('Query failed. Please try again.', 'error');
+        resultContent.innerHTML = `<div class="bg-red-50 border border-red-200 rounded p-4 text-red-800">Error: ${err.message}</div>`;
+      } finally {
+        setLoading(false);
       }
     });
   </script>
@@ -207,26 +234,42 @@ INDEX_HTML = """
 def index():
     return render_template_string(INDEX_HTML)
 
+# Health check route (simple and fast)
+@app.route('/health', methods=['GET'])
+def health():
+    try:
+        return jsonify({
+            'status': 'healthy',
+            'active_sessions': len(rag_instances),
+            'google_api_configured': bool(GOOGLE_API_KEY)
+        }), 200
+    except Exception as e:
+        logger.exception("Health check failed")
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
+
 # Upload PDF route
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
+    start_time = time.time()
+    
     try:
-        logger.info("Upload endpoint called")
+        logger.info("=== Upload Request Started ===")
         
-        # Validate request
+        # Validate request format
         if 'file' not in request.files:
-            logger.error("No file in request")
+            logger.error("No file in request.files")
             return jsonify({'error': 'No file provided'}), 400
             
         if 'session_id' not in request.form:
-            logger.error("No session_id in request")
+            logger.error("No session_id in request.form")
             return jsonify({'error': 'No session_id provided'}), 400
         
         file = request.files['file']
         session_id = request.form['session_id']
         
-        logger.info(f"Processing file: {file.filename} for session: {session_id}")
+        logger.info(f"Processing upload - File: {file.filename}, Session: {session_id}")
 
+        # Validate file
         if not file or file.filename == '':
             logger.error("Empty file provided")
             return jsonify({'error': 'No file selected'}), 400
@@ -235,171 +278,187 @@ def upload_pdf():
             logger.error(f"Invalid file type: {file.filename}")
             return jsonify({'error': 'Only PDF files are supported'}), 400
 
-        # Check if Google API key is available
-        google_api_key = os.getenv("GOOGLE_API_KEY")
-        if not google_api_key:
-            logger.error("GOOGLE_API_KEY not found in environment variables")
+        # Check environment
+        if not GOOGLE_API_KEY:
+            logger.error("GOOGLE_API_KEY not configured")
             return jsonify({'error': 'Server configuration error: Missing Google API key'}), 500
 
-        logger.info(f"Google API key found: {google_api_key[:10]}...")
-
-        # Create RAG instance
+        # Create or get RAG instance
+        logger.info("Getting RAG instance...")
         with processing_lock:
             if session_id not in rag_instances:
                 logger.info(f"Creating new RAG instance for session {session_id}")
                 try:
-                    collection_name = f"collection_{session_id}"
-                    logger.info(f"Initializing RAG with collection: {collection_name}")
+                    # Clean collection name for Qdrant
+                    collection_name = f"collection_{session_id.replace('-', '_')}"
+                    logger.info(f"Collection name: {collection_name}")
                     
-                    rag = PipelinedResearchPaperRAG(collection_name=collection_name)
+                    # Create RAG instance - ONLY pass collection_name
+                    rag = PipelinedResearchPaperRAG(collection_name)
                     rag_instances[session_id] = rag
-                    logger.info(f"RAG instance created successfully for session {session_id}")
+                    logger.info(f"RAG instance created for session {session_id}")
                     
                 except Exception as e:
-                    logger.error(f"Failed to create RAG instance: {e}")
+                    logger.error(f"RAG creation failed: {e}")
                     logger.error(traceback.format_exc())
-                    return jsonify({'error': f'Failed to initialize RAG system: {str(e)}'}), 500
+                    return jsonify({'error': f'Failed to initialize system: {str(e)}'}), 500
             else:
                 logger.info(f"Using existing RAG instance for session {session_id}")
                 rag = rag_instances[session_id]
 
-        # Save file
+        # Save uploaded file
+        logger.info("Saving uploaded file...")
         try:
-            filename = secure_filename(f"{session_id}_{file.filename}")
+            filename = secure_filename(f"{session_id}_{int(time.time())}_{file.filename}")
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(file_path)
-            logger.info(f"File saved to: {file_path}")
             
-            # Verify file was saved
+            # Verify file exists and has content
             if not os.path.exists(file_path):
-                raise Exception(f"File was not saved properly: {file_path}")
+                raise Exception("File was not saved successfully")
                 
             file_size = os.path.getsize(file_path)
-            logger.info(f"Saved file size: {file_size} bytes")
+            if file_size == 0:
+                raise Exception("Uploaded file is empty")
+                
+            logger.info(f"File saved: {file_path} ({file_size} bytes)")
             
         except Exception as e:
-            logger.error(f"Failed to save file: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"File save failed: {e}")
             return jsonify({'error': f'Failed to save file: {str(e)}'}), 500
 
-        # Process paper
+        # Process the paper
+        logger.info("Starting paper processing...")
         try:
-            logger.info("Starting paper processing...")
+            processing_start = time.time()
             metadata = rag.load_research_paper(file_path)
-            logger.info("Paper processing completed successfully")
+            processing_time = time.time() - processing_start
             
-            # Clean up the uploaded file
+            logger.info(f"Paper processing completed in {processing_time:.2f} seconds")
+            
+            # Clean up uploaded file
             try:
                 os.remove(file_path)
                 logger.info("Temporary file cleaned up")
-            except Exception as cleanup_error:
-                logger.warning(f"Failed to cleanup file: {cleanup_error}")
+            except Exception as e:
+                logger.warning(f"Cleanup warning: {e}")
+            
+            total_time = time.time() - start_time
+            logger.info(f"Upload completed successfully in {total_time:.2f} seconds")
             
             return jsonify({
-                'message': 'Paper uploaded and indexed successfully.',
+                'message': 'Document uploaded and processed successfully',
                 'session_id': session_id,
-                'collection_name': rag.collection_name,
-                'paper_metadata': metadata
+                'processing_time': round(processing_time, 2),
+                'total_time': round(total_time, 2),
+                'metadata': metadata
             }), 200
             
         except Exception as e:
-            logger.error(f"Failed to process paper: {e}")
+            logger.error(f"Paper processing failed: {e}")
             logger.error(traceback.format_exc())
             
-            # Clean up on failure
+            # Cleanup on failure
             try:
                 os.remove(file_path)
             except:
                 pass
                 
-            return jsonify({'error': f'Failed to process paper: {str(e)}'}), 500
+            return jsonify({'error': f'Failed to process document: {str(e)}'}), 500
 
     except Exception as e:
-        logger.error(f"Unexpected error in upload_pdf: {e}")
+        logger.error(f"Unexpected upload error: {e}")
         logger.error(traceback.format_exc())
-        return jsonify({'error': f'Unexpected server error: {str(e)}'}), 500
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 # Query route
 @app.route('/query', methods=['POST'])
 def query():
+    start_time = time.time()
+    
     try:
-        data = request.json
-        if not data:
-            return jsonify({'error': 'Invalid JSON data'}), 400
+        logger.info("=== Query Request Started ===")
+        
+        # Parse JSON request
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Invalid JSON data'}), 400
+        except Exception as e:
+            logger.error(f"JSON parsing failed: {e}")
+            return jsonify({'error': 'Invalid JSON format'}), 400
             
-        question = data.get('question')
-        session_id = data.get('session_id')
+        question = data.get('question', '').strip()
+        session_id = data.get('session_id', '').strip()
 
-        if not question or not session_id:
-            logger.error("Missing question or session_id in request")
-            return jsonify({'error': 'Missing question or session_id'}), 400
+        if not question:
+            return jsonify({'error': 'Question is required'}), 400
+            
+        if not session_id:
+            return jsonify({'error': 'Session ID is required'}), 400
 
+        logger.info(f"Query - Session: {session_id}, Question: {question[:100]}...")
+
+        # Get RAG instance
         rag = rag_instances.get(session_id)
         if not rag:
-            logger.warning(f"Session ID {session_id} not found")
-            return jsonify({'error': 'Invalid session_id. Please upload a document first.'}), 404
+            logger.warning(f"Session {session_id} not found")
+            return jsonify({'error': 'Session not found. Please upload a document first.'}), 404
 
+        # Process query
         try:
-            start_time = time.time()
-            result = rag.query(question)
-            duration = time.time() - start_time
+            logger.info("Processing query...")
+            query_start = time.time()
+            answer = rag.query(question)
+            query_time = time.time() - query_start
+            
+            total_time = time.time() - start_time
+            logger.info(f"Query completed in {query_time:.2f} seconds")
 
             return jsonify({
-                'answer': result,
+                'answer': answer,
                 'performance': {
-                    'query_time': round(duration, 2),
+                    'query_time': round(query_time, 2),
+                    'total_time': round(total_time, 2),
                     'session_id': session_id
                 }
             }), 200
+            
         except Exception as e:
-            logger.exception("Error during query processing")
-            return jsonify({'error': f'Query processing failed: {str(e)}'}), 500
+            logger.error(f"Query processing failed: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': f'Query failed: {str(e)}'}), 500
 
     except Exception as e:
-        logger.exception("Unexpected error in query")
-        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+        logger.error(f"Unexpected query error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 # Clear session route
 @app.route('/clear/<session_id>', methods=['DELETE'])
 def clear_session(session_id):
     try:
+        logger.info(f"Clearing session: {session_id}")
+        
         with processing_lock:
             rag = rag_instances.pop(session_id, None)
 
         if not rag:
-            logger.warning(f"Tried to clear non-existent session {session_id}")
             return jsonify({'error': 'Session not found'}), 404
 
+        # Cleanup
         try:
-            # Clean up Qdrant collection if possible
-            if hasattr(rag, 'qdrant_client') and hasattr(rag, 'collection_name'):
-                try:
-                    rag.qdrant_client.delete_collection(rag.collection_name)
-                except:
-                    pass  # Ignore cleanup errors
-            
-            return jsonify({'message': 'Session cleared successfully.'}), 200
+            if hasattr(rag, 'cleanup'):
+                rag.cleanup()
         except Exception as e:
-            logger.exception("Cleanup failed")
-            return jsonify({'error': f'Cleanup failed: {str(e)}'}), 500
-
+            logger.warning(f"Cleanup warning: {e}")
+        
+        logger.info(f"Session {session_id} cleared successfully")
+        return jsonify({'message': 'Session cleared successfully'}), 200
+        
     except Exception as e:
-        logger.exception("Unexpected error in clear_session")
-        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
-
-# Health check
-@app.route('/health', methods=['GET'])
-def health():
-    try:
-        # Simple health check
-        return jsonify({
-            'status': 'healthy',
-            'active_sessions': len(rag_instances),
-            'google_api_key_configured': bool(GOOGLE_API_KEY)
-        }), 200
-    except Exception as e:
-        logger.exception("Health check failed")
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
+        logger.error(f"Clear session error: {e}")
+        return jsonify({'error': f'Clear failed: {str(e)}'}), 500
 
 # Error handlers
 @app.errorhandler(413)
@@ -408,10 +467,15 @@ def too_large(e):
 
 @app.errorhandler(500)
 def internal_error(error):
-    logger.exception("Internal server error")
+    logger.error(f"Internal server error: {error}")
     return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
 
 # Main entry point
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
+    logger.info(f"Starting Flask app on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
