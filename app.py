@@ -238,11 +238,28 @@ def index():
 @app.route('/health', methods=['GET'])
 def health():
     try:
-        return jsonify({
+        health_status = {
             'status': 'healthy',
             'active_sessions': len(rag_instances),
-            'google_api_configured': bool(GOOGLE_API_KEY)
-        }), 200
+            'google_api_configured': bool(GOOGLE_API_KEY),
+            'qdrant_configured': bool(os.getenv("QDRANT_URL") and os.getenv("QDRANT_API_KEY"))
+        }
+        
+        # Test Qdrant connection if configured
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        
+        if qdrant_url and qdrant_api_key:
+            try:
+                from qdrant_client import QdrantClient
+                client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+                collections = client.get_collections()
+                health_status['qdrant_cloud_connection'] = 'ok'
+                health_status['qdrant_collections_count'] = len(collections.collections)
+            except Exception as e:
+                health_status['qdrant_cloud_connection'] = f'error: {str(e)}'
+        
+        return jsonify(health_status), 200
     except Exception as e:
         logger.exception("Health check failed")
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
