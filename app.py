@@ -3,7 +3,7 @@ import time
 import logging
 import threading
 import uuid
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from concurrent.futures import ThreadPoolExecutor
 from pipelined_research_rag import PipelinedResearchPaperRAG
@@ -11,25 +11,29 @@ from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Create Flask app
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # Environment config
 API_KEY = os.getenv("API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# Thread-safe dictionary to store per-session RAG pipelines
+# Session storage
 rag_instances = {}
 processing_lock = threading.Lock()
+
+@app.route('/')
+def index():
+    return render_template('index.html', sessions=list(rag_instances.keys()))
 
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
@@ -58,17 +62,16 @@ def upload_pdf():
     file.save(file_path)
 
     try:
-        rag.load_research_paper(file_path)
+        metadata = rag.load_research_paper(file_path)
         return jsonify({
             'message': 'Paper uploaded and indexed successfully.',
             'session_id': session_id,
             'collection_name': rag.collection_name,
-            'paper_metadata': rag.paper_metadata
+            'paper_metadata': metadata
         }), 200
     except Exception as e:
         logging.exception("Failed to process paper.")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/query', methods=['POST'])
 def query():
@@ -87,7 +90,7 @@ def query():
         start_time = time.time()
         with ThreadPoolExecutor(max_workers=rag.max_workers) as executor:
             future = executor.submit(rag.query, question)
-            result = future.result(timeout=60)  # 60s max
+            result = future.result(timeout=60)
         duration = time.time() - start_time
 
         return jsonify({
@@ -100,7 +103,6 @@ def query():
     except Exception as e:
         logging.exception("Error during query.")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/clear/<session_id>', methods=['DELETE'])
 def clear_session(session_id):
@@ -117,7 +119,6 @@ def clear_session(session_id):
         logging.exception("Cleanup failed.")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/health', methods=['GET'])
 def health():
     try:
@@ -127,7 +128,6 @@ def health():
     except UnexpectedResponse as e:
         logging.warning(f"Qdrant health check failed: {e}")
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
-
 
 if __name__ == '__main__':
     app.run(debug=True)
