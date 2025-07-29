@@ -1,0 +1,30 @@
+steps:
+  - name: "python:3.11.5-slim"
+    args:
+      - bash
+      - -c
+      - |
+        pip install --no-cache-dir -r requirements.txt
+        mkdir -p /app
+        cp -r . /app
+        cd /app
+        python -c "import os; print(f'Verifying PORT: {os.environ.get(\"PORT\", \"8080\")}')"
+    id: "install-dependencies"
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - "--tag=gcr.io/clever-airship-466111-h5/ragresearchpaper"
+      - .
+      - "-f"
+      - -
+      <<:EOF
+      FROM python:3.11.5-slim
+      WORKDIR /app
+      COPY --from=0 /app /app
+      ENV PORT=8080
+      CMD ["gunicorn", "--config", "gunicorn.conf.py", "wsgi:application"]
+      EOF
+    id: "build-image"
+    waitFor: ["install-dependencies"]
+images:
+  - "gcr.io/clever-airship-466111-h5/ragresearchpaper"
