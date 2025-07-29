@@ -38,10 +38,23 @@ class PipelinedResearchPaperRAG:
             raise ValueError("GOOGLE_API_KEY environment variable is required")
         genai.configure(api_key=api_key)
 
-        # Initialize Qdrant client (local file-based)
+        # Initialize Qdrant client (cloud or local)
         try:
-            self.qdrant_client = QdrantClient(path="./local_qdrant")
-            logger.info("Initialized local Qdrant client")
+            qdrant_url = os.getenv("QDRANT_URL")
+            qdrant_api_key = os.getenv("QDRANT_API_KEY")
+            
+            if qdrant_url and qdrant_api_key:
+                # Use cloud Qdrant
+                self.qdrant_client = QdrantClient(
+                    url=qdrant_url,
+                    api_key=qdrant_api_key,
+                )
+                logger.info(f"Initialized cloud Qdrant client: {qdrant_url[:50]}...")
+            else:
+                # Fallback to local Qdrant
+                self.qdrant_client = QdrantClient(path="./local_qdrant")
+                logger.info("Initialized local Qdrant client")
+                
         except Exception as e:
             logger.error(f"Failed to initialize Qdrant client: {e}")
             raise
@@ -177,15 +190,22 @@ class PipelinedResearchPaperRAG:
             try:
                 collections = self.qdrant_client.get_collections()
                 collection_exists = any(c.name == self.collection_name for c in collections.collections)
-            except:
+            except Exception as e:
+                logger.warning(f"Could not check collections: {e}")
                 collection_exists = False
             
             if not collection_exists:
-                self.qdrant_client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=VectorParams(size=len(embeddings[0]), distance=Distance.COSINE)
-                )
-                logger.info(f"Created collection: {self.collection_name}")
+                try:
+                    self.qdrant_client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=VectorParams(size=len(embeddings[0]), distance=Distance.COSINE)
+                    )
+                    logger.info(f"Created collection: {self.collection_name}")
+                except Exception as e:
+                    if "already exists" in str(e).lower():
+                        logger.info(f"Collection {self.collection_name} already exists")
+                    else:
+                        raise
 
             # Create points
             points = []
@@ -201,13 +221,18 @@ class PipelinedResearchPaperRAG:
                 )
                 points.append(point)
             
-            # Store in batches
+            # Store in batches to handle large documents
             batch_size = 100
             for i in range(0, len(points), batch_size):
                 batch = points[i:i+batch_size]
-                self.qdrant_client.upsert(collection_name=self.collection_name, points=batch)
+                try:
+                    self.qdrant_client.upsert(collection_name=self.collection_name, points=batch)
+                    logger.info(f"Stored batch {i//batch_size + 1}/{(len(points)-1)//batch_size + 1}")
+                except Exception as e:
+                    logger.error(f"Failed to store batch {i//batch_size + 1}: {e}")
+                    raise
             
-            logger.info(f"Stored {len(points)} chunks in Qdrant")
+            logger.info(f"Successfully stored {len(points)} chunks in Qdrant")
             
         except Exception as e:
             logger.error(f"Error storing chunks in Qdrant: {e}")
@@ -326,10 +351,17 @@ class PipelinedResearchPaperRAG:
         try:
             if hasattr(self, 'qdrant_client') and hasattr(self, 'collection_name'):
                 try:
-                    self.qdrant_client.delete_collection(self.collection_name)
-                    logger.info(f"Deleted collection: {self.collection_name}")
-                except:
-                    pass  # Ignore cleanup errors
+                    # For cloud Qdrant, we might not want to delete collections
+                    # as they could be shared or persistent
+                    qdrant_url = os.getenv("QDRANT_URL")
+                    if qdrant_url:
+                        logger.info(f"Skipping collection deletion for cloud Qdrant: {self.collection_name}")
+                    else:
+                        # Only delete for local Qdrant
+                        self.qdrant_client.delete_collection(self.collection_name)
+                        logger.info(f"Deleted local collection: {self.collection_name}")
+                except Exception as e:
+                    logger.warning(f"Collection cleanup warning: {e}")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
 
