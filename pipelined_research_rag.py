@@ -12,17 +12,12 @@ import time
 import google.api_core.exceptions
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.http.exceptions import UnexpectedResponse
 import uuid
-import sys
-import queue
-import threading
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Set up GenAI API key
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # Data structure to hold information between stages
 @dataclass
@@ -36,143 +31,311 @@ class PipelineData:
 class PipelinedResearchPaperRAG:
     def __init__(self, collection_name: str):
         self.collection_name = collection_name
+        
+        # Configure Google API
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY environment variable is required")
+        genai.configure(api_key=api_key)
 
-        # Initialize Qdrant client
-        self.qdrant_client = QdrantClient(path="./local_qdrant")
+        # Initialize Qdrant client (local file-based)
+        try:
+            self.qdrant_client = QdrantClient(path="./local_qdrant")
+            logger.info("Initialized local Qdrant client")
+        except Exception as e:
+            logger.error(f"Failed to initialize Qdrant client: {e}")
+            raise
 
-        # Set up embedding model
-        self.tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-        self.model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+        # Initialize embedding model with error handling
+        try:
+            model_name = "sentence-transformers/all-MiniLM-L6-v2"
+            logger.info(f"Loading embedding model: {model_name}")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name)
+            logger.info("Embedding model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load embedding model: {e}")
+            raise
 
-        # Set up Gemini model
-        self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        # Initialize Gemini model
+        try:
+            self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+            logger.info("Gemini model initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini model: {e}")
+            raise
 
     def _embed(self, texts: List[str]) -> List[List[float]]:
-        # Tokenize and embed
-        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
-        with torch.no_grad():
-            model_output = self.model(**inputs)
-        embeddings = model_output.last_hidden_state.mean(dim=1)
-        return embeddings.numpy().tolist()
+        """Generate embeddings for text chunks with error handling"""
+        try:
+            # Handle empty input
+            if not texts:
+                return []
+            
+            # Batch processing for efficiency
+            max_length = 512  # Limit token length
+            inputs = self.tokenizer(
+                texts, 
+                padding=True, 
+                truncation=True, 
+                max_length=max_length,
+                return_tensors="pt"
+            )
+            
+            with torch.no_grad():
+                model_output = self.model(**inputs)
+            
+            # Mean pooling
+            embeddings = model_output.last_hidden_state.mean(dim=1)
+            return embeddings.numpy().tolist()
+            
+        except Exception as e:
+            logger.error(f"Error in embedding generation: {e}")
+            raise
 
     def _extract_text_from_pdf(self, paper_path: str) -> str:
-        with open(paper_path, "rb") as file:
-            reader = PyPDF2.PdfReader(file)
-            text = " ".join(page.extract_text() or "" for page in reader.pages)
-        return text
+        """Extract text from PDF with better error handling"""
+        try:
+            if not os.path.exists(paper_path):
+                raise FileNotFoundError(f"PDF file not found: {paper_path}")
+            
+            text_parts = []
+            with open(paper_path, "rb") as file:
+                reader = PyPDF2.PdfReader(file)
+                
+                if len(reader.pages) == 0:
+                    raise ValueError("PDF file appears to be empty")
+                
+                for page_num, page in enumerate(reader.pages):
+                    try:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text_parts.append(page_text)
+                    except Exception as e:
+                        logger.warning(f"Failed to extract text from page {page_num}: {e}")
+                        continue
+            
+            if not text_parts:
+                raise ValueError("No text could be extracted from the PDF")
+            
+            full_text = " ".join(text_parts)
+            logger.info(f"Extracted {len(full_text)} characters from {len(text_parts)} pages")
+            return full_text
+            
+        except Exception as e:
+            logger.error(f"Error extracting PDF text: {e}")
+            raise
 
-    def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        text = re.sub(r'\s+', ' ', text)
-        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+    def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+        """Chunk text with overlap for better context preservation"""
+        try:
+            # Clean text
+            text = re.sub(r'\s+', ' ', text.strip())
+            
+            if len(text) <= chunk_size:
+                return [text]
+            
+            chunks = []
+            start = 0
+            
+            while start < len(text):
+                end = start + chunk_size
+                
+                # Try to break at word boundaries
+                if end < len(text):
+                    # Look for the last space within the chunk
+                    last_space = text.rfind(' ', start, end)
+                    if last_space > start:
+                        end = last_space
+                
+                chunk = text[start:end].strip()
+                if chunk:
+                    chunks.append(chunk)
+                
+                # Move start position with overlap
+                start = end - overlap
+                if start >= len(text):
+                    break
+            
+            logger.info(f"Created {len(chunks)} text chunks")
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Error in text chunking: {e}")
+            raise
 
     def _store_chunks(self, paper_id: str, chunks: List[str], embeddings: List[List[float]]):
-        if not self.qdrant_client.collection_exists(self.collection_name):
-            self.qdrant_client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(size=len(embeddings[0]), distance=Distance.COSINE)
-            )
+        """Store chunks in Qdrant with error handling"""
+        try:
+            if not chunks or not embeddings:
+                raise ValueError("No chunks or embeddings to store")
+            
+            if len(chunks) != len(embeddings):
+                raise ValueError(f"Mismatch: {len(chunks)} chunks vs {len(embeddings)} embeddings")
+            
+            # Create collection if it doesn't exist
+            try:
+                collections = self.qdrant_client.get_collections()
+                collection_exists = any(c.name == self.collection_name for c in collections.collections)
+            except:
+                collection_exists = False
+            
+            if not collection_exists:
+                self.qdrant_client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=len(embeddings[0]), distance=Distance.COSINE)
+                )
+                logger.info(f"Created collection: {self.collection_name}")
 
-        points = [
-            PointStruct(id=str(uuid.uuid4()), vector=embedding, payload={"chunk": chunk, "paper_id": paper_id})
-            for chunk, embedding in zip(chunks, embeddings)
-        ]
-        self.qdrant_client.upsert(collection_name=self.collection_name, points=points)
+            # Create points
+            points = []
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                point = PointStruct(
+                    id=str(uuid.uuid4()), 
+                    vector=embedding, 
+                    payload={
+                        "chunk": chunk, 
+                        "paper_id": paper_id,
+                        "chunk_index": i
+                    }
+                )
+                points.append(point)
+            
+            # Store in batches
+            batch_size = 100
+            for i in range(0, len(points), batch_size):
+                batch = points[i:i+batch_size]
+                self.qdrant_client.upsert(collection_name=self.collection_name, points=batch)
+            
+            logger.info(f"Stored {len(points)} chunks in Qdrant")
+            
+        except Exception as e:
+            logger.error(f"Error storing chunks in Qdrant: {e}")
+            raise
 
     def _extract_metadata(self, text: str) -> Dict:
-        prompt = (
-            "Given the text of a research paper, extract metadata including title, authors, abstract, and keywords. "
-            f"Here is the text: \n{text[:4000]}"
-        )
-        response = self.gemini_model.generate_content(prompt)
-        return {"extracted_metadata": response.text.strip()}
+        """Extract metadata using Gemini with better error handling"""
+        try:
+            # Limit text length for API call
+            text_preview = text[:4000] if len(text) > 4000 else text
+            
+            prompt = (
+                "Extract metadata from this research paper text. "
+                "Provide a structured response with title, authors, and a brief summary. "
+                "If information is not available, indicate 'Not found'.\n\n"
+                f"Text: {text_preview}"
+            )
+            
+            response = self.gemini_model.generate_content(prompt)
+            
+            if not response or not response.text:
+                return {"extracted_metadata": "Metadata extraction failed"}
+            
+            return {"extracted_metadata": response.text.strip()}
+            
+        except Exception as e:
+            logger.error(f"Error extracting metadata: {e}")
+            return {"extracted_metadata": f"Metadata extraction failed: {str(e)}"}
 
     def load_research_paper(self, paper_path: str) -> Dict:
-        paper_id = str(uuid.uuid4())
-        data = PipelineData(paper_id=paper_id, paper_path=paper_path)
+        """Load and process research paper - simplified sequential version"""
+        try:
+            paper_id = str(uuid.uuid4())
+            logger.info(f"Processing paper: {paper_path} with ID: {paper_id}")
 
-        # Define thread-safe queues for this instance
-        text_queue = queue.Queue()
-        chunk_queue = queue.Queue()
-        embedding_queue = queue.Queue()
+            # Step 1: Extract text
+            text = self._extract_text_from_pdf(paper_path)
 
-        # Stage 1: PDF Text Extraction
-        def extract_pdf():
-            logger.info(f"Extracting text from {data.paper_path}")
-            text = self._extract_text_from_pdf(data.paper_path)
-            text_queue.put(text)
-
-        # Stage 2: Chunking
-        def chunk_text():
-            text = text_queue.get()
-            logger.info("Chunking text")
+            # Step 2: Chunk text
             chunks = self._chunk_text(text)
-            data.text_chunks = chunks
-            chunk_queue.put(chunks)
 
-        # Stage 3: Embedding
-        def embed_chunks():
-            chunks = chunk_queue.get()
-            logger.info("Embedding chunks")
+            # Step 3: Generate embeddings
             embeddings = self._embed(chunks)
-            data.chunk_embeddings = embeddings
-            embedding_queue.put((chunks, embeddings))
 
-        # Stage 4: Store in Vector DB
-        def store_in_qdrant():
-            chunks, embeddings = embedding_queue.get()
-            logger.info("Storing in Qdrant")
-            self._store_chunks(data.paper_id, chunks, embeddings)
+            # Step 4: Store in vector database
+            self._store_chunks(paper_id, chunks, embeddings)
 
-        # Stage 5: Metadata Extraction
-        def extract_metadata():
-            text = text_queue.queue[0]  # Reuse the same text
-            logger.info("Extracting metadata")
-            data.metadata = self._extract_metadata(text)
+            # Step 5: Extract metadata
+            metadata = self._extract_metadata(text)
 
-        # Start pipeline threads
-        threads = [
-            threading.Thread(target=extract_pdf),
-            threading.Thread(target=chunk_text),
-            threading.Thread(target=embed_chunks),
-            threading.Thread(target=store_in_qdrant),
-            threading.Thread(target=extract_metadata),
-        ]
+            logger.info(f"Successfully processed paper {paper_id}")
+            return metadata
 
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        return data.metadata
+        except Exception as e:
+            logger.error(f"Error in load_research_paper: {e}")
+            raise
 
     def query(self, query_text: str, top_k: int = 5) -> str:
-        logger.info(f"Querying: {query_text}")
-        query_embedding = self._embed([query_text])[0]
-
+        """Query the loaded documents"""
         try:
-            results = self.qdrant_client.search(
-                collection_name=self.collection_name,
-                query_vector=query_embedding,
-                limit=top_k
+            logger.info(f"Querying: {query_text}")
+            
+            # Generate query embedding
+            query_embedding = self._embed([query_text])[0]
+
+            # Search in Qdrant
+            try:
+                results = self.qdrant_client.search(
+                    collection_name=self.collection_name,
+                    query_vector=query_embedding,
+                    limit=top_k
+                )
+            except Exception as e:
+                logger.error(f"Qdrant search failed: {e}")
+                return f"Search failed: {str(e)}"
+
+            if not results:
+                return "No relevant information found in the uploaded document."
+
+            # Build context from search results
+            context_parts = []
+            for i, hit in enumerate(results):
+                chunk_text = hit.payload.get("chunk", "")
+                score = hit.score
+                context_parts.append(f"Context {i+1} (relevance: {score:.3f}):\n{chunk_text}")
+
+            context = "\n\n".join(context_parts)
+
+            # Generate response using Gemini
+            prompt = (
+                f"Based on the following context from a research paper, "
+                f"please answer this question: {query_text}\n\n"
+                f"Context:\n{context}\n\n"
+                f"Please provide a comprehensive answer based on the context. "
+                f"If the context doesn't contain enough information to answer the question, "
+                f"please indicate that clearly."
             )
-        except google.api_core.exceptions.NotFound:
-            logger.error(f"Collection '{self.collection_name}' not found.")
-            return "No results found."
 
-        context = "\n".join([hit.payload["chunk"] for hit in results])
-        prompt = f"Using the following context, answer the query: {query_text}\n\nContext:\n{context}"
-        response = self.gemini_model.generate_content(prompt)
-        return response.text.strip()
+            try:
+                response = self.gemini_model.generate_content(prompt)
+                if response and response.text:
+                    return response.text.strip()
+                else:
+                    return "Failed to generate response from the model."
+                    
+            except Exception as e:
+                logger.error(f"Gemini generation failed: {e}")
+                return f"Response generation failed: {str(e)}"
 
-# Usage Example:
+        except Exception as e:
+            logger.error(f"Error in query: {e}")
+            return f"Query processing failed: {str(e)}"
+
+    def cleanup(self):
+        """Clean up resources"""
+        try:
+            if hasattr(self, 'qdrant_client') and hasattr(self, 'collection_name'):
+                try:
+                    self.qdrant_client.delete_collection(self.collection_name)
+                    logger.info(f"Deleted collection: {self.collection_name}")
+                except:
+                    pass  # Ignore cleanup errors
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+# Example usage (commented out for production)
 # if __name__ == '__main__':
-#     rag1 = PipelinedResearchPaperRAG("my_rag_collection")
-#     metadata1 = rag1.load_research_paper("path/to/first.pdf")
-#     print(metadata1)
-#
-#     rag2 = PipelinedResearchPaperRAG("my_rag_collection")
-#     metadata2 = rag2.load_research_paper("path/to/second.pdf")
-#     print(metadata2)
-#
-#     print(rag1.query("What is the main contribution?"))
-
+#     rag = PipelinedResearchPaperRAG("test_collection")
+#     metadata = rag.load_research_paper("path/to/paper.pdf")
+#     print(metadata)
+#     print(rag.query("What is the main contribution?"))
