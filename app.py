@@ -22,11 +22,6 @@ logger = logging.getLogger(__name__)
 # Create Flask app
 app = Flask(__name__)
 
-# Log routes at app initialization
-logger.info("=== Available Routes ===")
-for rule in app.url_map.iter_rules():
-    logger.info(f"{rule.endpoint}: {rule.rule} {list(rule.methods)}")
-
 # Upload folder
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -41,26 +36,84 @@ logger.info(f"Environment check - GOOGLE_API_KEY present: {bool(GOOGLE_API_KEY)}
 rag_instances = {}
 processing_lock = threading.Lock()
 
+# Test imports at startup
+RAG_AVAILABLE = False
+IMPORT_ERRORS = {}
+
+def test_imports():
+    """Test all critical imports at startup"""
+    global RAG_AVAILABLE, IMPORT_ERRORS
+    
+    imports_to_test = [
+        ('PyPDF2', 'PyPDF2'),
+        ('transformers', 'transformers'), 
+        ('torch', 'torch'),
+        ('google.generativeai', 'google-generativeai'),
+        ('qdrant_client', 'qdrant-client'),
+        ('numpy', 'numpy')
+    ]
+    
+    all_imports_ok = True
+    
+    for module_name, package_name in imports_to_test:
+        try:
+            __import__(module_name)
+            logger.info(f"✓ {package_name} imported successfully")
+        except ImportError as e:
+            logger.error(f"✗ {package_name} import failed: {e}")
+            IMPORT_ERRORS[package_name] = str(e)
+            all_imports_ok = False
+        except Exception as e:
+            logger.error(f"✗ {package_name} error: {e}")
+            IMPORT_ERRORS[package_name] = str(e)
+            all_imports_ok = False
+    
+    # Test RAG module specifically
+    try:
+        from pipelined_research_rag import PipelinedResearchPaperRAG
+        logger.info("✓ PipelinedResearchPaperRAG imported successfully")
+        RAG_AVAILABLE = True
+    except ImportError as e:
+        logger.error(f"✗ PipelinedResearchPaperRAG import failed: {e}")
+        IMPORT_ERRORS['pipelined_research_rag'] = str(e)
+        all_imports_ok = False
+    except Exception as e:
+        logger.error(f"✗ PipelinedResearchPaperRAG error: {e}")
+        IMPORT_ERRORS['pipelined_research_rag'] = str(e)
+        all_imports_ok = False
+    
+    if all_imports_ok:
+        logger.info("🎉 All imports successful - RAG system ready")
+    else:
+        logger.warning("⚠️  Some imports failed - RAG system may not work properly")
+
+# Test imports at startup
+test_imports()
+
 # Lazy import for RAG to avoid startup delay
 def get_rag_instance(collection_name):
-    """Lazily import and initialize RAG"""
+    """Lazily import and initialize RAG with comprehensive error handling"""
     try:
-        logger.info("Importing PipelinedResearchPaperRAG...")
+        if not RAG_AVAILABLE:
+            raise ImportError("RAG system not available - check import errors")
+            
+        if not GOOGLE_API_KEY:
+            raise ValueError("GOOGLE_API_KEY environment variable not set")
+            
+        logger.info(f"Creating RAG instance for collection: {collection_name}")
         from pipelined_research_rag import PipelinedResearchPaperRAG
-        logger.info("Successfully imported PipelinedResearchPaperRAG")
         return PipelinedResearchPaperRAG(collection_name)
+        
+    except ImportError as e:
+        logger.error(f"RAG import error: {e}")
+        raise Exception(f"RAG system not available: {e}")
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        raise Exception(f"Configuration error: {e}")
     except Exception as e:
-        logger.error(f"Failed to import PipelinedResearchPaperRAG: {e}")
+        logger.error(f"Failed to create RAG instance: {e}")
         logger.error(traceback.format_exc())
-        # Create a dummy class for testing
-        class DummyRAG:
-            def __init__(self, collection_name):
-                self.collection_name = collection_name
-            def load_research_paper(self, path):
-                return {"status": "dummy mode - RAG import failed"}
-            def query(self, question):
-                return "RAG system not available - check server logs"
-        return DummyRAG(collection_name)
+        raise Exception(f"Failed to initialize RAG system: {e}")
 
 # HTML template as string
 INDEX_HTML = """
@@ -84,11 +137,14 @@ INDEX_HTML = """
         <p class="text-gray-600">Upload a PDF research paper and ask questions about it</p>
       </div>
 
+      <!-- System Status -->
+      <div id="systemStatus" class="mb-6 hidden"></div>
+
       <!-- Main Interface -->
       <div class="bg-white rounded-lg shadow-lg p-6 mb-6">
         <!-- Status -->
         <div id="status" class="mb-6 p-4 rounded-lg text-center bg-blue-50 text-blue-800">
-          <span class="font-semibold">Ready</span> - Upload a PDF to get started
+          <span class="font-semibold">Initializing...</span> - Checking system status
         </div>
 
         <!-- Session ID -->
@@ -152,6 +208,7 @@ INDEX_HTML = """
     const uploadBtn = document.getElementById('uploadBtn');
     const queryBtn = document.getElementById('queryBtn');
     const fileNameDiv = document.getElementById('fileName');
+    const systemStatusDiv = document.getElementById('systemStatus');
 
     function setStatus(message, type = 'info') {
       const colors = {
@@ -174,6 +231,36 @@ INDEX_HTML = """
       } else {
         uploadBtn.textContent = 'Upload and Process';
         queryBtn.textContent = 'Ask';
+      }
+    }
+
+    function showSystemStatus(systemInfo) {
+      let statusHtml = '';
+      
+      if (!systemInfo.rag_available) {
+        statusHtml = `
+          <div class="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
+            <h3 class="text-red-800 font-semibold mb-2">⚠️ System Issues Detected</h3>
+            <p class="text-red-700 mb-2">The RAG system is not fully operational. Missing dependencies:</p>
+            <ul class="text-red-600 text-sm list-disc list-inside">
+              ${Object.entries(systemInfo.import_errors || {}).map(([pkg, err]) => 
+                `<li><strong>${pkg}:</strong> ${err}</li>`
+              ).join('')}
+            </ul>
+          </div>
+        `;
+      } else if (!systemInfo.google_api_configured) {
+        statusHtml = `
+          <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6">
+            <h3 class="text-yellow-800 font-semibold">⚠️ Configuration Issue</h3>
+            <p class="text-yellow-700">Google API key is not configured. Please check server configuration.</p>
+          </div>
+        `;
+      }
+      
+      if (statusHtml) {
+        systemStatusDiv.innerHTML = statusHtml;
+        systemStatusDiv.classList.remove('hidden');
       }
     }
 
@@ -215,7 +302,7 @@ INDEX_HTML = """
         const result = await response.json();
         
         if (!response.ok) {
-          throw new Error(result.error || 'Upload failed');
+          throw new Error(result.error || `HTTP ${response.status}: Upload failed`);
         }
 
         setStatus('Document processed successfully! You can now ask questions.', 'success');
@@ -273,7 +360,7 @@ INDEX_HTML = """
         const result = await response.json();
 
         if (!response.ok) {
-          throw new Error(result.error || 'Query failed');
+          throw new Error(result.error || `HTTP ${response.status}: Query failed`);
         }
 
         setStatus('Question answered successfully!', 'success');
@@ -313,20 +400,32 @@ INDEX_HTML = """
       }
     });
 
-    // Test server connection on load
-    fetch('/health')
-      .then(response => response.json())
-      .then(data => {
-        if (data.status === 'healthy') {
-          setStatus('Server connected and ready', 'success');
+    // Test server connection and system status on load
+    async function checkSystemStatus() {
+      try {
+        const [healthResponse, importsResponse] = await Promise.all([
+          fetch('/health'),
+          fetch('/debug')
+        ]);
+        
+        const healthData = await healthResponse.json();
+        const importsData = await importsResponse.json();
+        
+        if (healthData.status === 'healthy' && importsData.rag_available) {
+          setStatus('System ready - upload a PDF to get started', 'success');
         } else {
-          setStatus('Server health check failed', 'warning');
+          setStatus('System issues detected - check configuration', 'warning');
+          showSystemStatus(importsData);
         }
-      })
-      .catch(err => {
+        
+      } catch (err) {
         setStatus('Unable to connect to server', 'error');
-        console.error('Health check failed:', err);
-      });
+        console.error('System check failed:', err);
+      }
+    }
+    
+    // Initialize
+    checkSystemStatus();
   </script>
 </body>
 </html>
@@ -346,19 +445,96 @@ def health():
             'status': 'healthy',
             'active_sessions': len(rag_instances),
             'google_api_configured': bool(GOOGLE_API_KEY),
-            'upload_folder_exists': os.path.exists(UPLOAD_FOLDER)
+            'upload_folder_exists': os.path.exists(UPLOAD_FOLDER),
+            'rag_available': RAG_AVAILABLE
         }), 200
     except Exception as e:
         logger.exception("Health check failed")
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
 
+@app.route('/debug', methods=['GET'])
+def debug_environment():
+    """Debug endpoint to check environment setup"""
+    try:
+        env_status = {
+            'GOOGLE_API_KEY': bool(GOOGLE_API_KEY),
+            'QDRANT_URL': bool(os.getenv("QDRANT_URL")),
+            'QDRANT_API_KEY': bool(os.getenv("QDRANT_API_KEY")),
+            'PORT': os.getenv('PORT', '8080'),
+            'upload_folder_exists': os.path.exists(UPLOAD_FOLDER),
+            'upload_folder_writable': os.access(UPLOAD_FOLDER, os.W_OK) if os.path.exists(UPLOAD_FOLDER) else False,
+        }
+        
+        return jsonify({
+            'environment': env_status,
+            'import_errors': IMPORT_ERRORS,
+            'rag_available': RAG_AVAILABLE,
+            'python_version': sys.version,
+            'working_directory': os.getcwd()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/test-imports', methods=['GET'])
+def test_imports_endpoint():
+    """Test all critical imports"""
+    results = {}
+    
+    # Test each import individually
+    imports_to_test = [
+        ('os', 'os'),
+        ('flask', 'Flask'),
+        ('dotenv', 'python-dotenv'),
+        ('PyPDF2', 'PyPDF2'),
+        ('transformers', 'transformers'),
+        ('torch', 'torch'),
+        ('google.generativeai', 'google-generativeai'),
+        ('qdrant_client', 'qdrant-client'),
+        ('numpy', 'numpy')
+    ]
+    
+    for module_name, package_name in imports_to_test:
+        try:
+            __import__(module_name)
+            results[package_name] = "✓ Available"
+        except ImportError as e:
+            results[package_name] = f"✗ Missing: {e}"
+        except Exception as e:
+            results[package_name] = f"✗ Error: {e}"
+    
+    # Test RAG module specifically
+    try:
+        from pipelined_research_rag import PipelinedResearchPaperRAG
+        results['pipelined_research_rag'] = "✓ Available"
+    except ImportError as e:
+        results['pipelined_research_rag'] = f"✗ Import Error: {e}"
+    except Exception as e:
+        results['pipelined_research_rag'] = f"✗ Error: {e}"
+    
+    return jsonify({
+        'imports': results,
+        'google_api_configured': bool(GOOGLE_API_KEY),
+        'rag_available': RAG_AVAILABLE,
+        'import_errors': IMPORT_ERRORS
+    }), 200
+
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
-    """Upload and process PDF"""
+    """Upload and process PDF with comprehensive error handling"""
     start_time = time.time()
     
     try:
         logger.info("=== Upload Request Started ===")
+        
+        # Check if RAG is available first
+        if not RAG_AVAILABLE:
+            logger.error("RAG system not available")
+            return jsonify({
+                'error': 'RAG system not available. Check server configuration.',
+                'details': 'Required dependencies may be missing',
+                'import_errors': IMPORT_ERRORS
+            }), 503
         
         # Validate request
         if 'file' not in request.files:
@@ -404,7 +580,10 @@ def upload_pdf():
                 except Exception as e:
                     logger.error(f"RAG creation failed: {e}")
                     logger.error(traceback.format_exc())
-                    return jsonify({'error': f'Failed to initialize system: {str(e)}'}), 500
+                    return jsonify({
+                        'error': f'Failed to initialize system: {str(e)}',
+                        'type': type(e).__name__
+                    }), 500
             else:
                 logger.info(f"Using existing RAG instance for session {session_id}")
                 rag = rag_instances[session_id]
@@ -424,7 +603,10 @@ def upload_pdf():
             
         except Exception as e:
             logger.error(f"File save failed: {e}")
-            return jsonify({'error': f'Failed to save file: {str(e)}'}), 500
+            return jsonify({
+                'error': f'Failed to save file: {str(e)}',
+                'type': type(e).__name__
+            }), 500
 
         # Process paper
         logger.info("Starting paper processing...")
@@ -462,20 +644,33 @@ def upload_pdf():
             except:
                 pass
                 
-            return jsonify({'error': f'Failed to process document: {str(e)}'}), 500
+            return jsonify({
+                'error': f'Failed to process document: {str(e)}',
+                'type': type(e).__name__
+            }), 500
 
     except Exception as e:
         logger.error(f"Unexpected upload error: {e}")
         logger.error(traceback.format_exc())
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        return jsonify({
+            'error': f'Server error: {str(e)}',
+            'type': type(e).__name__
+        }), 500
 
 @app.route('/query', methods=['POST'])
 def query():
-    """Process query"""
+    """Process query with comprehensive error handling"""
     start_time = time.time()
     
     try:
         logger.info("=== Query Request Started ===")
+        
+        # Check if RAG is available
+        if not RAG_AVAILABLE:
+            return jsonify({
+                'error': 'RAG system not available',
+                'import_errors': IMPORT_ERRORS
+            }), 503
         
         try:
             data = request.get_json()
@@ -524,12 +719,18 @@ def query():
         except Exception as e:
             logger.error(f"Query processing failed: {e}")
             logger.error(traceback.format_exc())
-            return jsonify({'error': f'Query failed: {str(e)}'}), 500
+            return jsonify({
+                'error': f'Query failed: {str(e)}',
+                'type': type(e).__name__
+            }), 500
 
     except Exception as e:
         logger.error(f"Unexpected query error: {e}")
         logger.error(traceback.format_exc())
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        return jsonify({
+            'error': f'Server error: {str(e)}',
+            'type': type(e).__name__
+        }), 500
 
 @app.route('/clear/<session_id>', methods=['DELETE'])
 def clear_session(session_id):
@@ -577,8 +778,16 @@ def handle_exception(e):
     logger.error(traceback.format_exc())
     return jsonify({'error': 'An unexpected error occurred'}), 500
 
+# Log routes at app initialization
+logger.info("=== Available Routes ===")
+for rule in app.url_map.iter_rules():
+    logger.info(f"{rule.endpoint}: {rule.rule} {list(rule.methods)}")
+
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Starting Flask app on port {port}")
     logger.info(f"Debug mode: {os.environ.get('FLASK_DEBUG', 'False')}")
+    logger.info(f"RAG Available: {RAG_AVAILABLE}")
+    if IMPORT_ERRORS:
+        logger.warning(f"Import Errors: {IMPORT_ERRORS}")
     app.run(host="0.0.0.0", port=port, debug=False)
